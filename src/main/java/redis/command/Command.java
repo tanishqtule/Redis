@@ -16,6 +16,8 @@ public record Command(String name, int arity, Set<Flag> flags, Handler handler) 
     public enum Flag {
         /** Modifies the keyspace: refused on replicas, propagated by masters. */
         WRITE,
+        /** Reads the keyspace: a replica serving linearizable reads checks it's caught up first. */
+        READ,
         /** Runs immediately even inside MULTI (MULTI, EXEC, DISCARD, ...). */
         TX_CONTROL,
         /** May block for a while, so it must not hold the global lock. */

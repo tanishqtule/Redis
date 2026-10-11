@@ -1,6 +1,7 @@
 package redis.command;
 
 import static redis.command.Command.Flag.BLOCKING;
+import static redis.command.Command.Flag.READ;
 import static redis.command.Command.Flag.TX_CONTROL;
 import static redis.command.Command.Flag.WRITE;
 
@@ -39,6 +40,8 @@ public final class CommandTable {
     private final boolean readOnly;
 
     private Consumer<List<byte[]>> replicationSink = args -> { };
+    /** Run before reads on connections that asked for linearizable reads. Only replicas set one. */
+    private Runnable linearizableReadBarrier;
     /** Writes made by the EXEC currently running, so they can be propagated as one MULTI/EXEC block. */
     private List<List<byte[]>> execWrites;
 
@@ -57,6 +60,14 @@ public final class CommandTable {
 
     public void register(String name, int arity, Command.Handler handler) {
         register(name, arity, Set.of(), handler);
+    }
+
+    /**
+     * Installs the check a replica runs before a linearizable read. It either
+     * returns once the replica is caught up, or throws a CommandException.
+     */
+    public void setLinearizableReadBarrier(Runnable barrier) {
+        this.linearizableReadBarrier = barrier;
     }
 
     /** Where successful writes go. Set by the server when replication is in play. */
@@ -92,6 +103,17 @@ public final class CommandTable {
             return Resp.QUEUED;
         }
 
+        if (needsReadBarrier(session, command)) {
+            // Outside the lock: waiting for the replica to catch up must not stall everyone else.
+            try {
+                linearizableReadBarrier.run();
+            } catch (CommandException e) {
+                if (command.name().equals("EXEC")) {
+                    session.endMulti();
+                }
+                return Resp.error(e.getMessage());
+            }
+        }
         if (command.has(BLOCKING)) {
             return invoke(command, session, args);
         }
@@ -101,6 +123,14 @@ public final class CommandTable {
         } finally {
             lock.unlock();
         }
+    }
+
+    private boolean needsReadBarrier(Session session, Command command) {
+        if (linearizableReadBarrier == null || !session.linearizableReads() || session.isFromMaster()) {
+            return false;
+        }
+        // Inside MULTI only EXEC/DISCARD get this far; queued reads are checked once, at EXEC.
+        return command.has(READ) || command.name().equals("EXEC") && session.inMulti();
     }
 
     /** Sends a write to replicas. Callers must hold the lock so the stream order matches execution order. */

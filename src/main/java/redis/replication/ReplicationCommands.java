@@ -16,7 +16,7 @@ import redis.server.Session;
 import redis.store.Keyspace;
 
 /**
- * REPLCONF, PSYNC, WAIT and ROLE. Exactly one of {@code master}
+ * REPLCONF, PSYNC, WAIT, ROLE and WAITOFFSET. Exactly one of {@code master}
  * and {@code link} is set, depending on whether this server is a master or a
  * replica.
  */
@@ -37,6 +37,7 @@ public final class ReplicationCommands {
         table.register("PSYNC", 3, this::psync);
         table.register("WAIT", 3, Set.of(BLOCKING), this::waitForReplicas);
         table.register("ROLE", 1, (s, args) -> master != null ? master.role() : link.role());
+        table.register("WAITOFFSET", 3, Set.of(BLOCKING), this::waitOffset);
     }
 
     private byte[] replconf(Session session, List<byte[]> args) {
@@ -95,6 +96,33 @@ public final class ReplicationCommands {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new CommandException("ERR interrupted while waiting for replicas");
+        }
+    }
+
+    /**
+     * WAITOFFSET offset timeout: the replica-side counterpart of WAIT. Blocks
+     * until this replica has applied the master's stream up to {@code offset}
+     * (as reported by ROLE on the master), then returns the offset reached.
+     * A result below the requested offset means the timeout passed first.
+     *
+     * A client that remembers the master's offset after its write and calls
+     * this before reading from a replica is guaranteed to see that write.
+     */
+    private byte[] waitOffset(Session session, List<byte[]> args) {
+        long target = Args.parseLong(args.get(1));
+        long timeout = Args.parseLong(args.get(2));
+        if (timeout < 0) {
+            throw new CommandException("ERR timeout is negative");
+        }
+        if (master != null) {
+            // A master has applied everything it has ever streamed.
+            return Resp.integer(master.offset());
+        }
+        try {
+            return Resp.integer(link.awaitOffset(target, timeout));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new CommandException("ERR interrupted while waiting for the replication offset");
         }
     }
 }

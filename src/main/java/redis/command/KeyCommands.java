@@ -1,5 +1,6 @@
 package redis.command;
 
+import static redis.command.Command.Flag.READ;
 import static redis.command.Command.Flag.WRITE;
 
 import java.util.ArrayList;
@@ -15,6 +16,7 @@ import redis.store.Keyspace;
 public final class KeyCommands {
 
     private static final Set<Command.Flag> W = Set.of(WRITE);
+    private static final Set<Command.Flag> R = Set.of(READ);
 
     private final Keyspace db;
 
@@ -23,27 +25,27 @@ public final class KeyCommands {
     }
 
     public void registerAll(CommandTable table) {
-        table.register("GET", 2, (s, a) -> Resp.bulk(db.get(Args.str(a, 1))));
+        table.register("GET", 2, R, (s, a) -> Resp.bulk(db.get(Args.str(a, 1))));
         table.register("SET", -3, W, this::set);
-        table.register("MGET", -2, this::mget);
+        table.register("MGET", -2, R, this::mget);
         table.register("APPEND", 3, W, this::append);
-        table.register("STRLEN", 2, (s, a) -> Resp.integer(lengthOf(db.get(Args.str(a, 1)))));
+        table.register("STRLEN", 2, R, (s, a) -> Resp.integer(lengthOf(db.get(Args.str(a, 1)))));
         table.register("INCR", 2, W, (s, a) -> incrementBy(a, 1));
         table.register("DECR", 2, W, (s, a) -> incrementBy(a, -1));
         table.register("INCRBY", 3, W, (s, a) -> incrementBy(a, Args.parseLong(a.get(2))));
         table.register("DECRBY", 3, W, (s, a) -> incrementBy(a, negate(Args.parseLong(a.get(2)))));
 
         table.register("DEL", -2, W, this::del);
-        table.register("EXISTS", -2, this::exists);
-        table.register("TYPE", 2, (s, a) -> Resp.simple(db.exists(Args.str(a, 1)) ? "string" : "none"));
-        table.register("KEYS", 2, this::keys);
-        table.register("DBSIZE", 1, (s, a) -> Resp.integer(db.size()));
+        table.register("EXISTS", -2, R, this::exists);
+        table.register("TYPE", 2, R, (s, a) -> Resp.simple(db.exists(Args.str(a, 1)) ? "string" : "none"));
+        table.register("KEYS", 2, R, this::keys);
+        table.register("DBSIZE", 1, R, (s, a) -> Resp.integer(db.size()));
         table.register("FLUSHALL", -1, W, this::flushAll);
 
         table.register("EXPIRE", 3, W, (s, a) -> expire(a, 1000));
         table.register("PEXPIRE", 3, W, (s, a) -> expire(a, 1));
-        table.register("TTL", 2, (s, a) -> ttl(a, 1000));
-        table.register("PTTL", 2, (s, a) -> ttl(a, 1));
+        table.register("TTL", 2, R, (s, a) -> ttl(a, 1000));
+        table.register("PTTL", 2, R, (s, a) -> ttl(a, 1));
         table.register("PERSIST", 2, W, (s, a) -> Resp.integer(db.persist(Args.str(a, 1)) ? 1 : 0));
     }
 

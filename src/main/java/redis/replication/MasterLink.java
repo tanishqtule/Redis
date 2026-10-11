@@ -7,11 +7,14 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.IntSupplier;
 import java.util.logging.Logger;
 
 import redis.command.Args;
+import redis.command.CommandException;
 import redis.command.CommandTable;
 import redis.persistence.Rdb;
 import redis.protocol.Resp;
@@ -29,6 +32,7 @@ public final class MasterLink implements Runnable {
     private static final Logger log = Logger.getLogger(MasterLink.class.getName());
     private static final long RETRY_DELAY_MS = 1000;
     private static final long ACK_INTERVAL_MS = 1000;
+    private static final int LINEARIZABLE_READ_TIMEOUT_MS = 1000;
 
     private final String host;
     private final int port;
@@ -54,7 +58,15 @@ public final class MasterLink implements Runnable {
      * reply, not from zero. -1 until the first sync.
      */
     private volatile long offset = -1;
+    /** The replication id from the last FULLRESYNC: which history {@code offset} counts in. */
+    private volatile String masterReplId;
     private volatile Socket socket;
+
+    private final ReadIndex readIndex;
+    private final AtomicLong linearizableReads = new AtomicLong();
+
+    private final Object progress = new Object();
+    private volatile int waiters;
 
     public MasterLink(String host, int port, IntSupplier listeningPort,
                       ReentrantLock commandLock, Keyspace db, CommandTable commands) {
@@ -64,6 +76,7 @@ public final class MasterLink implements Runnable {
         this.commandLock = commandLock;
         this.db = db;
         this.commands = commands;
+        this.readIndex = new ReadIndex(host, port, LINEARIZABLE_READ_TIMEOUT_MS);
     }
 
     @Override
@@ -90,6 +103,7 @@ public final class MasterLink implements Runnable {
 
     public void stop() throws IOException {
         running = false;
+        readIndex.close();
         Socket s = socket;
         if (s != null) {
             s.close();
@@ -104,6 +118,84 @@ public final class MasterLink implements Runnable {
         return offset;
     }
 
+    /**
+     * Blocks until this replica has applied the master's stream up to
+     * {@code target}, or the timeout passes (0 = no timeout). Returns the
+     * offset reached, so the caller can tell which of the two happened.
+     */
+    public long awaitOffset(long target, long timeoutMillis) throws InterruptedException {
+        long reached = offset;
+        if (reached >= target) {
+            return reached;
+        }
+        long deadline = timeoutMillis == 0 ? Long.MAX_VALUE : System.currentTimeMillis() + timeoutMillis;
+        synchronized (progress) {
+            waiters++;
+            try {
+                while ((reached = offset) < target) {
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining <= 0) {
+                        break;
+                    }
+                    progress.wait(remaining);
+                }
+            } finally {
+                waiters--;
+            }
+        }
+        return reached;
+    }
+
+    /**
+     * Holds a read back until this replica has caught up with everything the
+     * master had applied when the read arrived, which makes the read
+     * linearizable: it can't return anything older than a write that
+     * finished before it started.
+     *
+     * Costs one small request to the master (shared between concurrent
+     * readers) plus however long the replica takes to catch up. Throws a
+     * MASTERDOWN or TRYAGAIN error rather than ever answering stale.
+     */
+    public void awaitLinearizable() {
+        if (!isLinkUp()) {
+            throw new CommandException("MASTERDOWN Link with MASTER is down, so a linearizable read can't be served");
+        }
+        long started = System.currentTimeMillis();
+        ReadIndex.Position index;
+        try {
+            index = readIndex.fetch(LINEARIZABLE_READ_TIMEOUT_MS);
+        } catch (TimeoutException e) {
+            throw new CommandException("MASTERDOWN master didn't report its offset within "
+                    + LINEARIZABLE_READ_TIMEOUT_MS + " ms");
+        } catch (IOException e) {
+            throw new CommandException("MASTERDOWN couldn't ask the master for its offset: " + e.getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new CommandException("ERR interrupted while waiting for the master");
+        }
+        if (!index.replId().equals(masterReplId)) {
+            // The master has a different history than the one we copied (it
+            // restarted, say), so our offset says nothing about freshness.
+            throw new CommandException("TRYAGAIN replica is still following an old replication history");
+        }
+        long remaining = Math.max(1, LINEARIZABLE_READ_TIMEOUT_MS - (System.currentTimeMillis() - started));
+        long reached;
+        try {
+            reached = awaitOffset(index.offset(), remaining);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new CommandException("ERR interrupted while waiting for the replication offset");
+        }
+        if (!index.replId().equals(masterReplId)) {
+            throw new CommandException("TRYAGAIN replica resynced with a different history while waiting");
+        }
+        if (reached < index.offset()) {
+            throw new CommandException("TRYAGAIN replica is at offset " + reached + " but the read needs "
+                    + index.offset() + "; it didn't catch up within " + LINEARIZABLE_READ_TIMEOUT_MS + " ms");
+        }
+        linearizableReads.incrementAndGet();
+    }
+
     public List<String> info() {
         List<String> lines = new ArrayList<>();
         lines.add("role:slave");
@@ -112,6 +204,8 @@ public final class MasterLink implements Runnable {
         lines.add("master_link_status:" + (isLinkUp() ? "up" : "down"));
         lines.add("slave_repl_offset:" + offset);
         lines.add("connected_slaves:0");
+        lines.add("linearizable_reads:" + linearizableReads.get());
+        lines.add("read_index_round_trips:" + readIndex.roundTrips());
         return lines;
     }
 
@@ -165,6 +259,7 @@ public final class MasterLink implements Runnable {
         if (parts.length != 3 || !parts[0].equals("FULLRESYNC")) {
             throw new IOException("expected FULLRESYNC <replid> <offset>, master said: " + reply);
         }
+        masterReplId = parts[1];
         try {
             return Long.parseLong(parts[2]);
         } catch (NumberFormatException e) {
@@ -203,6 +298,12 @@ public final class MasterLink implements Runnable {
 
     private void advanceTo(long newOffset) {
         offset = newOffset;
+        // Only pay for the monitor when someone is actually waiting (WAITOFFSET, linearizable reads).
+        if (waiters > 0) {
+            synchronized (progress) {
+                progress.notifyAll();
+            }
+        }
     }
 
     // Real masters drop replicas that stay quiet for repl-timeout (60 s), so

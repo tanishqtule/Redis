@@ -41,6 +41,7 @@ public final class ServerCommands {
         table.register("CONFIG", -2, this::config);
         table.register("SAVE", 1, this::save);
         table.register("INFO", -1, this::info);
+        table.register("CLIENT", -2, this::client);
         // Only database 0 exists. Accepting SELECT 0 matters because a real
         // master starts its replication stream with it.
         table.register("SELECT", 2, (s, args) -> {
@@ -49,6 +50,47 @@ public final class ServerCommands {
             }
             return Resp.OK;
         });
+    }
+
+    private byte[] client(Session session, List<byte[]> args) {
+        String sub = Args.upper(args.get(1));
+        return switch (sub) {
+            case "ID" -> Resp.integer(session.id());
+            case "GETNAME" -> session.name().isEmpty() ? Resp.NULL_BULK : Resp.bulk(session.name());
+            case "SETNAME" -> {
+                String name = Args.str(args, args.size() == 3 ? 2 : 1);
+                if (args.size() != 3 || !name.chars().allMatch(c -> c > ' ' && c <= '~')) {
+                    throw new CommandException("ERR Client names cannot contain spaces, newlines or special characters.");
+                }
+                session.setName(name);
+                yield Resp.OK;
+            }
+            // Client libraries announce their name and version on connect; nothing to keep.
+            case "SETINFO" -> Resp.OK;
+            case "CONSISTENCY" -> consistency(session, args);
+            default -> throw new CommandException("ERR unknown subcommand '" + Args.str(args, 1) + "'");
+        };
+    }
+
+    /**
+     * CLIENT CONSISTENCY [LINEARIZABLE | EVENTUAL]. Linearizable makes reads on
+     * a replica wait until they can't miss any write the master had already
+     * acknowledged. A master's reads are always linearizable, so there it's
+     * accepted and changes nothing.
+     */
+    private byte[] consistency(Session session, List<byte[]> args) {
+        if (args.size() == 2) {
+            return Resp.bulk(session.linearizableReads() ? "linearizable" : "eventual");
+        }
+        if (args.size() != 3) {
+            throw CommandException.syntax();
+        }
+        switch (Args.upper(args.get(2))) {
+            case "LINEARIZABLE" -> session.setLinearizableReads(true);
+            case "EVENTUAL" -> session.setLinearizableReads(false);
+            default -> throw new CommandException("ERR consistency must be LINEARIZABLE or EVENTUAL");
+        }
+        return Resp.OK;
     }
 
     private byte[] info(Session session, List<byte[]> args) {

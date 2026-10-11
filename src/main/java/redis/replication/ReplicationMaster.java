@@ -28,12 +28,14 @@ public final class ReplicationMaster {
     private final List<ReplicaHandle> replicas = new CopyOnWriteArrayList<>();
     private final Object ackSignal = new Object();
     private final ReentrantLock commandLock;
+    private final long simulatedLagMillis;
 
     /** Guarded by the command lock for writes; volatile so INFO can read it without the lock. */
     private volatile long offset;
 
-    public ReplicationMaster(ReentrantLock commandLock) {
+    public ReplicationMaster(ReentrantLock commandLock, long simulatedLagMillis) {
         this.commandLock = commandLock;
+        this.simulatedLagMillis = simulatedLagMillis;
     }
 
     public String replId() {
@@ -59,7 +61,7 @@ public final class ReplicationMaster {
      * same moment, and no write can slip in between.
      */
     public void startFullResync(Session session, byte[] snapshot) {
-        ReplicaHandle replica = new ReplicaHandle(session, offset);
+        ReplicaHandle replica = new ReplicaHandle(session, offset, simulatedLagMillis);
         replica.send(Args.raw("+FULLRESYNC " + replId + " " + offset + "\r\n"));
         replica.send(Args.raw("$" + snapshot.length + "\r\n"));
         replica.send(snapshot);

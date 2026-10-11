@@ -56,8 +56,12 @@ public final class RedisServer implements AutoCloseable {
             replication = null;
             masterLink = new MasterLink(config.masterHost(), config.masterPort(), this::port, lock, db, commands);
             db.setOwnsExpiry(false);
+            commands.setLinearizableReadBarrier(masterLink::awaitLinearizable);
         } else {
-            replication = new ReplicationMaster(lock);
+            replication = new ReplicationMaster(lock, config.simulatedReplicationLagMs());
+            if (config.simulatedReplicationLagMs() > 0) {
+                log.warning("simulating " + config.simulatedReplicationLagMs() + " ms of replication lag");
+            }
             masterLink = null;
             commands.setReplicationSink(replication::propagate);
             // Replicas never expire keys on their own, so tell them explicitly.

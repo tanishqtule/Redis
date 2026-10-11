@@ -19,15 +19,21 @@ final class ReplicaHandle {
 
     private static final Logger log = Logger.getLogger(ReplicaHandle.class.getName());
 
+    private record Pending(long dueAt, byte[] bytes) {
+    }
+
     final Session session;
     private final OutputStream out;
-    private final BlockingQueue<byte[]> outbound = new LinkedBlockingQueue<>();
+    private final long lagMillis;
+    private final BlockingQueue<Pending> outbound = new LinkedBlockingQueue<>();
     private final Thread writer;
     private volatile long ackedOffset;
 
-    ReplicaHandle(Session session, long startOffset) {
+    /** @param lagMillis artificial delay before anything is sent; 0 except in experiments */
+    ReplicaHandle(Session session, long startOffset, long lagMillis) {
         this.session = session;
         this.out = session.out();
+        this.lagMillis = lagMillis;
         this.ackedOffset = startOffset;
         this.writer = Thread.ofVirtual().name("replica-writer-" + session.peer()).unstarted(this::drain);
     }
@@ -37,7 +43,9 @@ final class ReplicaHandle {
     }
 
     void send(byte[] bytes) {
-        outbound.add(bytes);
+        // Stamping the deadline here, rather than when the writer picks the
+        // item up, keeps the delay constant instead of piling up under load.
+        outbound.add(new Pending(System.currentTimeMillis() + lagMillis, bytes));
     }
 
     long ackedOffset() {
@@ -55,11 +63,12 @@ final class ReplicaHandle {
     private void drain() {
         try {
             while (true) {
-                byte[] next = outbound.take();
-                out.write(next);
-                // Batch whatever else piled up before paying for a flush.
-                while ((next = outbound.poll()) != null) {
-                    out.write(next);
+                Pending next = outbound.take();
+                sleepUntil(next.dueAt());
+                out.write(next.bytes());
+                // Batch whatever else is already due before paying for a flush.
+                while ((next = outbound.peek()) != null && next.dueAt() <= System.currentTimeMillis()) {
+                    out.write(outbound.poll().bytes());
                 }
                 out.flush();
             }
@@ -72,6 +81,13 @@ final class ReplicaHandle {
             } catch (IOException ignored) {
                 // Already broken; closing just makes the read side notice too.
             }
+        }
+    }
+
+    private static void sleepUntil(long deadline) throws InterruptedException {
+        long wait = deadline - System.currentTimeMillis();
+        if (wait > 0) {
+            Thread.sleep(wait);
         }
     }
 }

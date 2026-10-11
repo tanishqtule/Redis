@@ -2,13 +2,20 @@ package redis.server;
 
 import java.nio.file.Path;
 
-/** Startup options. Immutable once the server is running. */
-public record Config(int port, String masterHost, int masterPort, String dir, String dbFilename) {
+/**
+ * Startup options. Immutable once the server is running.
+ *
+ * @param simulatedReplicationLagMs test knob: a master holds back everything
+ *        it sends to replicas by this long, so replica staleness can be
+ *        reproduced on one machine. 0 in normal use.
+ */
+public record Config(int port, String masterHost, int masterPort, String dir, String dbFilename,
+                     int simulatedReplicationLagMs) {
 
     public static final int DEFAULT_PORT = 6379;
 
     public static Config defaults() {
-        return new Config(DEFAULT_PORT, null, 0, ".", "dump.rdb");
+        return new Config(DEFAULT_PORT, null, 0, ".", "dump.rdb", 0);
     }
 
     public boolean isReplica() {
@@ -20,19 +27,23 @@ public record Config(int port, String masterHost, int masterPort, String dir, St
     }
 
     public Config withPort(int port) {
-        return new Config(port, masterHost, masterPort, dir, dbFilename);
+        return new Config(port, masterHost, masterPort, dir, dbFilename, simulatedReplicationLagMs);
     }
 
     public Config withMaster(String host, int port) {
-        return new Config(this.port, host, port, dir, dbFilename);
+        return new Config(this.port, host, port, dir, dbFilename, simulatedReplicationLagMs);
     }
 
     public Config withDir(String dir) {
-        return new Config(port, masterHost, masterPort, dir, dbFilename);
+        return new Config(port, masterHost, masterPort, dir, dbFilename, simulatedReplicationLagMs);
     }
 
     public Config withDbFilename(String dbFilename) {
-        return new Config(port, masterHost, masterPort, dir, dbFilename);
+        return new Config(port, masterHost, masterPort, dir, dbFilename, simulatedReplicationLagMs);
+    }
+
+    public Config withSimulatedReplicationLag(int millis) {
+        return new Config(port, masterHost, masterPort, dir, dbFilename, millis);
     }
 
     /**
@@ -57,6 +68,8 @@ public record Config(int port, String masterHost, int masterPort, String dir, St
                     }
                     config = config.withMaster(parts[0], parsePort(parts[1]));
                 }
+                case "--simulate-replication-lag" ->
+                        config = config.withSimulatedReplicationLag(parseMillis(value(args, ++i, flag)));
                 default -> throw new IllegalArgumentException("unknown option " + flag);
             }
         }
@@ -79,6 +92,18 @@ public record Config(int port, String masterHost, int masterPort, String dir, St
             return port;
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException("invalid port '" + s + "'");
+        }
+    }
+
+    private static int parseMillis(String s) {
+        try {
+            int ms = Integer.parseInt(s);
+            if (ms < 0) {
+                throw new NumberFormatException();
+            }
+            return ms;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("invalid duration '" + s + "' (milliseconds expected)");
         }
     }
 }
