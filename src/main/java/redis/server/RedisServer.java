@@ -4,6 +4,8 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -16,6 +18,7 @@ import redis.command.Args;
 import redis.command.CommandTable;
 import redis.command.KeyCommands;
 import redis.command.ServerCommands;
+import redis.persistence.Rdb;
 import redis.store.Keyspace;
 
 public final class RedisServer implements AutoCloseable {
@@ -38,7 +41,7 @@ public final class RedisServer implements AutoCloseable {
     public RedisServer(Config config) {
         this.config = config;
         this.commands = new CommandTable(lock, config.isReplica());
-        new ServerCommands().registerAll(commands);
+        new ServerCommands(config, db).registerAll(commands);
         new KeyCommands(db).registerAll(commands);
 
         db.setOwnsExpiry(!config.isReplica());
@@ -47,6 +50,9 @@ public final class RedisServer implements AutoCloseable {
     }
 
     public void start() throws IOException {
+        if (!config.isReplica()) {
+            loadSnapshot();
+        }
         listener = new ServerSocket();
         listener.setReuseAddress(true);
         listener.bind(new InetSocketAddress(config.port()));
@@ -86,6 +92,23 @@ public final class RedisServer implements AutoCloseable {
                 }
             }
         }
+    }
+
+    /** A replica skips this: whatever it has on disk is stale, the master will send a fresh copy. */
+    private void loadSnapshot() throws IOException {
+        Path path = config.rdbPath();
+        if (!Files.exists(path)) {
+            return;
+        }
+        long now = db.now();
+        int[] loaded = {0};
+        Rdb.read(Files.readAllBytes(path), (key, value, expireAt) -> {
+            if (expireAt == Keyspace.NO_EXPIRY || expireAt > now) {
+                db.set(key, value, expireAt);
+                loaded[0]++;
+            }
+        });
+        log.info("loaded " + loaded[0] + " keys from " + path);
     }
 
     private void expireKeys() {
