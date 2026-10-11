@@ -4,12 +4,19 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Logger;
 
+import redis.command.Args;
 import redis.command.CommandTable;
+import redis.command.KeyCommands;
 import redis.command.ServerCommands;
+import redis.store.Keyspace;
 
 public final class RedisServer implements AutoCloseable {
 
@@ -17,14 +24,26 @@ public final class RedisServer implements AutoCloseable {
 
     private final Config config;
     private final ReentrantLock lock = new ReentrantLock();
-    private final CommandTable commands = new CommandTable(lock);
+    private final Keyspace db = new Keyspace();
+    private final CommandTable commands;
     private final CountDownLatch stopped = new CountDownLatch(1);
+    private final ScheduledExecutorService housekeeping = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "housekeeping");
+        t.setDaemon(true);
+        return t;
+    });
 
     private ServerSocket listener;
 
     public RedisServer(Config config) {
         this.config = config;
+        this.commands = new CommandTable(lock, config.isReplica());
         new ServerCommands().registerAll(commands);
+        new KeyCommands(db).registerAll(commands);
+
+        db.setOwnsExpiry(!config.isReplica());
+        // Replicas never expire keys on their own, so tell them explicitly.
+        db.onExpire(key -> commands.propagate(List.of(Args.raw("DEL"), Args.raw(key))));
     }
 
     public void start() throws IOException {
@@ -34,6 +53,7 @@ public final class RedisServer implements AutoCloseable {
         log.info("listening on port " + port());
 
         Thread.ofPlatform().name("accept").start(this::acceptLoop);
+        housekeeping.scheduleWithFixedDelay(this::expireKeys, 100, 100, TimeUnit.MILLISECONDS);
     }
 
     /** The bound port, which differs from the configured one when that was 0. */
@@ -47,6 +67,7 @@ public final class RedisServer implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
+        housekeeping.shutdownNow();
         listener.close();
         stopped.countDown();
     }
@@ -64,6 +85,19 @@ public final class RedisServer implements AutoCloseable {
                     log.warning("accept failed: " + e.getMessage());
                 }
             }
+        }
+    }
+
+    private void expireKeys() {
+        lock.lock();
+        try {
+            // Keep going while there's a backlog, but give clients a turn between batches.
+            while (db.expireCycle(200) == 200) {
+                lock.unlock();
+                lock.lock();
+            }
+        } finally {
+            lock.unlock();
         }
     }
 
