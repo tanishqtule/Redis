@@ -11,7 +11,7 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import redis.TestClient;
+import redis.protocol.RespClient;
 
 class PersistenceTest {
 
@@ -21,7 +21,7 @@ class PersistenceTest {
 
         try (RedisServer first = new RedisServer(config)) {
             first.start();
-            try (TestClient c = new TestClient(first.port())) {
+            try (RespClient c = new RespClient(first.port())) {
                 c.call("SET", "kept", "yes");
                 c.call("SET", "ttl", "v", "EX", "100");
                 c.call("SET", "gone", "v", "PX", "50");
@@ -33,7 +33,7 @@ class PersistenceTest {
 
         try (RedisServer second = new RedisServer(config)) {
             second.start();
-            try (TestClient c = new TestClient(second.port())) {
+            try (RespClient c = new RespClient(second.port())) {
                 assertEquals("yes", c.call("GET", "kept"));
                 long ttl = (Long) c.call("TTL", "ttl");
                 assertTrue(ttl > 90 && ttl <= 100, "ttl was " + ttl);
@@ -47,7 +47,7 @@ class PersistenceTest {
         Config config = Config.defaults().withPort(0).withDir(dir.toString()).withDbFilename("x.rdb");
         try (RedisServer server = new RedisServer(config)) {
             server.start();
-            try (TestClient c = new TestClient(server.port())) {
+            try (RespClient c = new RespClient(server.port())) {
                 assertEquals(List.of("dbfilename", "x.rdb"), c.call("CONFIG", "GET", "dbfilename"));
                 assertEquals(List.of("dir", dir.toAbsolutePath().normalize().toString()),
                         c.call("CONFIG", "GET", "dir"));

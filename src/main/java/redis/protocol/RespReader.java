@@ -103,6 +103,49 @@ public final class RespReader {
         return readExactly((int) length);
     }
 
+    /**
+     * Reads one reply of any type, for code acting as a client. Simple strings
+     * come back as String, errors as {@link RespError}, integers as Long, bulk
+     * strings as byte[], arrays as List, and null bulk strings or arrays as null.
+     */
+    public Object readReply() throws IOException {
+        int type = readByte();
+        return switch (type) {
+            case '+' -> readLine();
+            case '-' -> new RespError(readLine());
+            case ':' -> readLength();
+            case '$' -> {
+                long length = readLength();
+                if (length < 0) {
+                    yield null;
+                }
+                if (length > MAX_BULK) {
+                    throw new ProtocolException("invalid bulk length");
+                }
+                byte[] data = readExactly((int) length);
+                if (readByte() != '\r' || readByte() != '\n') {
+                    throw new ProtocolException("bulk string not terminated by CRLF");
+                }
+                yield data;
+            }
+            case '*' -> {
+                long count = readLength();
+                if (count < 0) {
+                    yield null;
+                }
+                if (count > MAX_ARGS) {
+                    throw new ProtocolException("invalid array length");
+                }
+                List<Object> items = new ArrayList<>((int) count);
+                for (int i = 0; i < count; i++) {
+                    items.add(readReply());
+                }
+                yield items;
+            }
+            default -> throw new ProtocolException("unknown reply type '" + (char) type + "'");
+        };
+    }
+
     private List<byte[]> readInline(int first) throws IOException {
         StringBuilder line = new StringBuilder();
         line.append((char) first);

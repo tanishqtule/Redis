@@ -14,14 +14,14 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import redis.TestClient;
-import redis.TestClient.Err;
+import redis.protocol.RespClient;
+import redis.protocol.RespError;
 
 class ReplicationTest {
 
     private final List<AutoCloseable> cleanup = new ArrayList<>();
     private RedisServer master;
-    private TestClient onMaster;
+    private RespClient onMaster;
 
     @BeforeEach
     void startMaster() throws Exception {
@@ -39,7 +39,7 @@ class ReplicationTest {
     @Test
     void replicaGetsExistingDataAndLaterWrites() throws Exception {
         onMaster.call("SET", "before", "1");
-        TestClient onReplica = client(replicaOf(master));
+        RespClient onReplica = client(replicaOf(master));
         awaitValue(onReplica, "before", "1");
 
         onMaster.call("SET", "after", "2");
@@ -53,7 +53,7 @@ class ReplicationTest {
 
     @Test
     void transactionsReachReplicasWhole() throws Exception {
-        TestClient onReplica = client(replicaOf(master));
+        RespClient onReplica = client(replicaOf(master));
         onMaster.call("MULTI");
         onMaster.call("SET", "a", "1");
         onMaster.call("SET", "b", "2");
@@ -64,8 +64,8 @@ class ReplicationTest {
 
     @Test
     void replicaRefusesClientWrites() throws Exception {
-        TestClient onReplica = client(replicaOf(master));
-        Err err = assertInstanceOf(Err.class, onReplica.call("SET", "x", "1"));
+        RespClient onReplica = client(replicaOf(master));
+        RespError err = assertInstanceOf(RespError.class, onReplica.call("SET", "x", "1"));
         assertTrue(err.message().startsWith("READONLY"));
         assertEquals("PONG", onReplica.call("PING"));
     }
@@ -93,7 +93,7 @@ class ReplicationTest {
         for (int i = 0; i < 20; i++) {
             onMaster.call("SET", "early:" + i, "x");
         }
-        TestClient onReplica = client(replicaOf(master));
+        RespClient onReplica = client(replicaOf(master));
         awaitValue(onReplica, "early:19", "x");
         // Let at least one periodic ACK through, so the master has heard from the replica.
         Thread.sleep(1200);
@@ -113,7 +113,7 @@ class ReplicationTest {
 
     @Test
     void expiryOnMasterIsPropagated() throws Exception {
-        TestClient onReplica = client(replicaOf(master));
+        RespClient onReplica = client(replicaOf(master));
         onMaster.call("SET", "short", "v", "PX", "100");
         awaitValue(onReplica, "short", "v");
         Thread.sleep(400);
@@ -123,7 +123,7 @@ class ReplicationTest {
 
     @Test
     void infoReportsRoles() throws Exception {
-        TestClient onReplica = client(replicaOf(master));
+        RespClient onReplica = client(replicaOf(master));
         String masterInfo = (String) onMaster.call("INFO", "replication");
         assertTrue(masterInfo.contains("role:master"), masterInfo);
         assertTrue(masterInfo.contains("master_replid:"), masterInfo);
@@ -134,14 +134,14 @@ class ReplicationTest {
     @Test
     void replicaResyncsAfterMasterRestart() throws Exception {
         int port = master.port();
-        TestClient onReplica = client(replicaOf(master));
+        RespClient onReplica = client(replicaOf(master));
         onMaster.call("SET", "gen", "1");
         awaitValue(onReplica, "gen", "1");
 
         onMaster.close();
         master.close();
         RedisServer second = startOnSamePort(port);
-        TestClient onSecond = client(second);
+        RespClient onSecond = client(second);
         onSecond.call("SET", "gen", "2");
         awaitValue(onReplica, "gen", "2");
     }
@@ -172,13 +172,13 @@ class ReplicationTest {
         return start(Config.defaults().withPort(0).withMaster("127.0.0.1", of.port()));
     }
 
-    private TestClient client(RedisServer server) throws Exception {
-        TestClient c = new TestClient(server.port());
+    private RespClient client(RedisServer server) throws Exception {
+        RespClient c = new RespClient(server.port());
         cleanup.add(c);
         return c;
     }
 
-    private static void awaitValue(TestClient client, String key, String expected) throws Exception {
+    private static void awaitValue(RespClient client, String key, String expected) throws Exception {
         Object last = null;
         for (int i = 0; i < 100; i++) {
             last = client.call("GET", key);
@@ -190,7 +190,7 @@ class ReplicationTest {
         fail("expected " + key + "=" + expected + " but it stayed " + last);
     }
 
-    private static void awaitInfo(TestClient client, String line) throws Exception {
+    private static void awaitInfo(RespClient client, String line) throws Exception {
         for (int i = 0; i < 100; i++) {
             if (((String) client.call("INFO", "replication")).contains(line)) {
                 return;

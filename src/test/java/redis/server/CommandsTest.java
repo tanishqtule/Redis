@@ -16,20 +16,20 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import redis.TestClient;
-import redis.TestClient.Err;
+import redis.protocol.RespClient;
+import redis.protocol.RespError;
 
 /** Drives a real server over a socket, the way a client would. */
 class CommandsTest {
 
     private RedisServer server;
-    private TestClient client;
+    private RespClient client;
 
     @BeforeEach
     void start() throws Exception {
         server = new RedisServer(Config.defaults().withPort(0));
         server.start();
-        client = new TestClient(server.port());
+        client = new RespClient(server.port());
     }
 
     @AfterEach
@@ -49,9 +49,9 @@ class CommandsTest {
 
     @Test
     void unknownCommandsAndBadArityGetErrorsNotSilence() throws Exception {
-        Err unknown = assertInstanceOf(Err.class, client.call("NOPE", "x"));
+        RespError unknown = assertInstanceOf(RespError.class, client.call("NOPE", "x"));
         assertTrue(unknown.message().startsWith("ERR unknown command 'NOPE'"));
-        Err arity = assertInstanceOf(Err.class, client.call("GET"));
+        RespError arity = assertInstanceOf(RespError.class, client.call("GET"));
         assertEquals("ERR wrong number of arguments for 'get' command", arity.message());
         assertEquals("PONG", client.call("PING"));
     }
@@ -63,9 +63,9 @@ class CommandsTest {
         assertNull(client.call("SET", "other", "2", "XX"));
         assertEquals("1", client.call("SET", "k", "3", "GET"));
         assertEquals("3", client.call("GET", "k"));
-        assertInstanceOf(Err.class, client.call("SET", "k", "v", "NX", "XX"));
-        assertInstanceOf(Err.class, client.call("SET", "k", "v", "EX", "0"));
-        assertInstanceOf(Err.class, client.call("SET", "k", "v", "BOGUS"));
+        assertInstanceOf(RespError.class, client.call("SET", "k", "v", "NX", "XX"));
+        assertInstanceOf(RespError.class, client.call("SET", "k", "v", "EX", "0"));
+        assertInstanceOf(RespError.class, client.call("SET", "k", "v", "BOGUS"));
     }
 
     @Test
@@ -103,9 +103,9 @@ class CommandsTest {
         assertEquals(11L, client.call("INCRBY", "n", "10"));
         assertEquals(9L, client.call("DECRBY", "n", "2"));
         client.call("SET", "s", "abc");
-        assertEquals(new Err("ERR value is not an integer or out of range"), client.call("INCR", "s"));
+        assertEquals(new RespError("ERR value is not an integer or out of range"), client.call("INCR", "s"));
         client.call("SET", "big", String.valueOf(Long.MAX_VALUE));
-        assertInstanceOf(Err.class, client.call("INCR", "big"));
+        assertInstanceOf(RespError.class, client.call("INCR", "big"));
     }
 
     @Test
@@ -116,7 +116,7 @@ class CommandsTest {
         List<Future<?>> done = new ArrayList<>();
         for (int c = 0; c < clients; c++) {
             done.add(pool.submit((Callable<Void>) () -> {
-                try (TestClient tc = new TestClient(server.port())) {
+                try (RespClient tc = new RespClient(server.port())) {
                     for (int i = 0; i < perClient; i++) {
                         tc.call("INCR", "hits");
                     }
@@ -133,16 +133,16 @@ class CommandsTest {
 
     @Test
     void manyIdleClientsDoNotStarveNewOnes() throws Exception {
-        List<TestClient> idle = new ArrayList<>();
+        List<RespClient> idle = new ArrayList<>();
         try {
             for (int i = 0; i < 200; i++) {
-                idle.add(new TestClient(server.port()));
+                idle.add(new RespClient(server.port()));
             }
-            try (TestClient late = new TestClient(server.port())) {
+            try (RespClient late = new RespClient(server.port())) {
                 assertEquals("PONG", late.call("PING"));
             }
         } finally {
-            for (TestClient c : idle) {
+            for (RespClient c : idle) {
                 c.close();
             }
         }
@@ -192,26 +192,26 @@ class CommandsTest {
         client.call("INCR", "s");
         client.call("SET", "t", "ok");
         List<?> replies = (List<?>) client.call("EXEC");
-        assertInstanceOf(Err.class, replies.get(0));
+        assertInstanceOf(RespError.class, replies.get(0));
         assertEquals("OK", replies.get(1));
     }
 
     @Test
     void transactionAbortsOnQueueTimeError() throws Exception {
         client.call("MULTI");
-        assertInstanceOf(Err.class, client.call("NOTACOMMAND"));
+        assertInstanceOf(RespError.class, client.call("NOTACOMMAND"));
         client.call("SET", "x", "1");
-        Err err = assertInstanceOf(Err.class, client.call("EXEC"));
+        RespError err = assertInstanceOf(RespError.class, client.call("EXEC"));
         assertTrue(err.message().startsWith("EXECABORT"));
         assertNull(client.call("GET", "x"));
     }
 
     @Test
     void transactionControlErrors() throws Exception {
-        assertEquals(new Err("ERR EXEC without MULTI"), client.call("EXEC"));
-        assertEquals(new Err("ERR DISCARD without MULTI"), client.call("DISCARD"));
+        assertEquals(new RespError("ERR EXEC without MULTI"), client.call("EXEC"));
+        assertEquals(new RespError("ERR DISCARD without MULTI"), client.call("DISCARD"));
         client.call("MULTI");
-        assertEquals(new Err("ERR MULTI calls can not be nested"), client.call("MULTI"));
+        assertEquals(new RespError("ERR MULTI calls can not be nested"), client.call("MULTI"));
         client.call("SET", "x", "1");
         assertEquals("OK", client.call("DISCARD"));
         assertNull(client.call("GET", "x"));
@@ -226,7 +226,7 @@ class CommandsTest {
     @Test
     void transactionIsIsolatedFromOtherClients() throws Exception {
         client.call("SET", "n", "0");
-        try (TestClient other = new TestClient(server.port())) {
+        try (RespClient other = new RespClient(server.port())) {
             client.call("MULTI");
             client.call("INCR", "n");
             other.call("INCR", "n");
