@@ -7,6 +7,8 @@ import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -19,6 +21,9 @@ import redis.command.CommandTable;
 import redis.command.KeyCommands;
 import redis.command.ServerCommands;
 import redis.persistence.Rdb;
+import redis.replication.MasterLink;
+import redis.replication.ReplicationCommands;
+import redis.replication.ReplicationMaster;
 import redis.store.Keyspace;
 
 public final class RedisServer implements AutoCloseable {
@@ -36,17 +41,33 @@ public final class RedisServer implements AutoCloseable {
         return t;
     });
 
+    /** Exactly one of these is non-null, depending on the role. */
+    private final ReplicationMaster replication;
+    private final MasterLink masterLink;
+
+    private final Set<Socket> clients = ConcurrentHashMap.newKeySet();
     private ServerSocket listener;
 
     public RedisServer(Config config) {
         this.config = config;
         this.commands = new CommandTable(lock, config.isReplica());
-        new ServerCommands(config, db).registerAll(commands);
-        new KeyCommands(db).registerAll(commands);
 
-        db.setOwnsExpiry(!config.isReplica());
-        // Replicas never expire keys on their own, so tell them explicitly.
-        db.onExpire(key -> commands.propagate(List.of(Args.raw("DEL"), Args.raw(key))));
+        if (config.isReplica()) {
+            replication = null;
+            masterLink = new MasterLink(config.masterHost(), config.masterPort(), this::port, lock, db, commands);
+            db.setOwnsExpiry(false);
+        } else {
+            replication = new ReplicationMaster(lock);
+            masterLink = null;
+            commands.setReplicationSink(replication::propagate);
+            // Replicas never expire keys on their own, so tell them explicitly.
+            db.onExpire(key -> commands.propagate(List.of(Args.raw("DEL"), Args.raw(key))));
+        }
+
+        new ServerCommands(config, db, replication != null ? replication::info : masterLink::info)
+                .registerAll(commands);
+        new KeyCommands(db).registerAll(commands);
+        new ReplicationCommands(replication, db).registerAll(commands);
     }
 
     public void start() throws IOException {
@@ -55,11 +76,20 @@ public final class RedisServer implements AutoCloseable {
         }
         listener = new ServerSocket();
         listener.setReuseAddress(true);
-        listener.bind(new InetSocketAddress(config.port()));
+        try {
+            listener.bind(new InetSocketAddress(config.port()));
+        } catch (IOException e) {
+            listener.close();
+            throw e;
+        }
         log.info("listening on port " + port());
 
         Thread.ofPlatform().name("accept").start(this::acceptLoop);
-        housekeeping.scheduleWithFixedDelay(this::expireKeys, 100, 100, TimeUnit.MILLISECONDS);
+        if (masterLink != null) {
+            Thread.ofVirtual().name("master-link").start(masterLink);
+        } else {
+            housekeeping.scheduleWithFixedDelay(this::expireKeys, 100, 100, TimeUnit.MILLISECONDS);
+        }
     }
 
     /** The bound port, which differs from the configured one when that was 0. */
@@ -74,7 +104,13 @@ public final class RedisServer implements AutoCloseable {
     @Override
     public void close() throws IOException {
         housekeeping.shutdownNow();
+        if (masterLink != null) {
+            masterLink.stop();
+        }
         listener.close();
+        for (Socket client : clients) {
+            client.close();
+        }
         stopped.countDown();
     }
 
@@ -84,8 +120,9 @@ public final class RedisServer implements AutoCloseable {
         while (!listener.isClosed()) {
             try {
                 Socket socket = listener.accept();
+                clients.add(socket);
                 Thread.ofVirtual().name("client-" + socket.getPort())
-                        .start(new Connection(socket, commands, this::onDisconnect));
+                        .start(new Connection(socket, commands, session -> onDisconnect(socket, session)));
             } catch (IOException e) {
                 if (!listener.isClosed()) {
                     log.warning("accept failed: " + e.getMessage());
@@ -124,6 +161,10 @@ public final class RedisServer implements AutoCloseable {
         }
     }
 
-    private void onDisconnect(Session session) {
+    private void onDisconnect(Socket socket, Session session) {
+        clients.remove(socket);
+        if (replication != null && session.isReplica()) {
+            replication.remove(session);
+        }
     }
 }

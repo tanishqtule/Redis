@@ -4,7 +4,7 @@ import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Per-connection state. Only ever touched by the connection's own thread. */
+/** Per-connection state. Apart from the listening port, only the connection's own thread touches it. */
 public final class Session {
 
     private final String peer;
@@ -17,6 +17,7 @@ public final class Session {
 
     private boolean closeRequested;
     private boolean replica;
+    private volatile int listeningPort;
 
     public Session(String peer, OutputStream out, boolean fromMaster) {
         this.peer = peer;
@@ -87,5 +88,14 @@ public final class Session {
 
     public boolean isReplica() {
         return replica;
+    }
+
+    /** The port a replica says it listens on (REPLCONF listening-port). Only shown in INFO. */
+    public int listeningPort() {
+        return listeningPort;
+    }
+
+    public void setListeningPort(int port) {
+        this.listeningPort = port;
     }
 }

@@ -89,6 +89,10 @@ public final class RespReader {
      */
     public byte[] readRdbPayload() throws IOException {
         int type = readByte();
+        // A real master sends bare newlines as keep-alives while it prepares the snapshot.
+        while (type == '\n') {
+            type = readByte();
+        }
         if (type != '$') {
             throw new ProtocolException("expected RDB payload, got '" + (char) type + "'");
         }

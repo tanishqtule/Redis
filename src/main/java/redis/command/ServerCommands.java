@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import redis.persistence.Rdb;
 import redis.protocol.Resp;
@@ -21,10 +22,13 @@ public final class ServerCommands {
 
     private final Config config;
     private final Keyspace db;
+    private final Supplier<List<String>> replicationInfo;
+    private final long startedAt = System.currentTimeMillis();
 
-    public ServerCommands(Config config, Keyspace db) {
+    public ServerCommands(Config config, Keyspace db, Supplier<List<String>> replicationInfo) {
         this.config = config;
         this.db = db;
+        this.replicationInfo = replicationInfo;
     }
 
     public void registerAll(CommandTable table) {
@@ -36,6 +40,50 @@ public final class ServerCommands {
         table.register("COMMAND", -1, (s, args) -> Resp.EMPTY_ARRAY);
         table.register("CONFIG", -2, this::config);
         table.register("SAVE", 1, this::save);
+        table.register("INFO", -1, this::info);
+        // Only database 0 exists. Accepting SELECT 0 matters because a real
+        // master starts its replication stream with it.
+        table.register("SELECT", 2, (s, args) -> {
+            if (Args.parseLong(args.get(1)) != 0) {
+                throw new CommandException("ERR DB index is out of range");
+            }
+            return Resp.OK;
+        });
+    }
+
+    private byte[] info(Session session, List<byte[]> args) {
+        List<String> wanted = new ArrayList<>();
+        for (int i = 1; i < args.size(); i++) {
+            wanted.add(Args.str(args, i).toLowerCase());
+        }
+        boolean all = wanted.isEmpty() || wanted.contains("all") || wanted.contains("everything");
+
+        StringBuilder out = new StringBuilder();
+        if (all || wanted.contains("server")) {
+            section(out, "Server", List.of(
+                    "server_name:redis-java",
+                    "redis_version:0.1.0",
+                    "tcp_port:" + config.port(),
+                    "uptime_in_seconds:" + (System.currentTimeMillis() - startedAt) / 1000));
+        }
+        if (all || wanted.contains("replication")) {
+            section(out, "Replication", replicationInfo.get());
+        }
+        if (all || wanted.contains("keyspace")) {
+            section(out, "Keyspace", db.size() == 0 ? List.of()
+                    : List.of("db0:keys=" + db.size() + ",expires=" + db.volatileKeys() + ",avg_ttl=0"));
+        }
+        return Resp.bulk(out.toString());
+    }
+
+    private static void section(StringBuilder out, String title, List<String> lines) {
+        if (!out.isEmpty()) {
+            out.append("\r\n");
+        }
+        out.append("# ").append(title).append("\r\n");
+        for (String line : lines) {
+            out.append(line).append("\r\n");
+        }
     }
 
     private byte[] ping(Session session, List<byte[]> args) {

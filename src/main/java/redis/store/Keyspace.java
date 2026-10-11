@@ -94,8 +94,15 @@ public final class Keyspace {
         put(key, new Entry(value, expireAt));
     }
 
+    /**
+     * Returns whether a live key was deleted. An expired key still gets
+     * physically removed: on a replica, the master's DEL is the only thing
+     * that ever clears it out.
+     */
     public boolean delete(String key) {
-        return lookup(key) != null && remove(key);
+        boolean live = lookup(key) != null;
+        remove(key);
+        return live;
     }
 
     /** -2 if the key doesn't exist, -1 if it has no expiry, otherwise the unix ms deadline. */
