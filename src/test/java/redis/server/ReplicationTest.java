@@ -88,6 +88,24 @@ class ReplicationTest {
     }
 
     @Test
+    void replicaThatJoinsLateReportsOffsetsInTheMastersSpace() throws Exception {
+        // Writes before the replica exists move the master's offset away from 0.
+        for (int i = 0; i < 20; i++) {
+            onMaster.call("SET", "early:" + i, "x");
+        }
+        TestClient onReplica = client(replicaOf(master));
+        awaitValue(onReplica, "early:19", "x");
+        // Let at least one periodic ACK through, so the master has heard from the replica.
+        Thread.sleep(1200);
+
+        onMaster.call("SET", "late", "y");
+        assertEquals(1L, onMaster.call("WAIT", "1", "2000"));
+        List<?> role = (List<?>) onReplica.call("ROLE");
+        List<?> masterRole = (List<?>) onMaster.call("ROLE");
+        assertEquals(masterRole.get(1), role.get(4), "replica and master should agree on the offset");
+    }
+
+    @Test
     void waitWithNoReplicasReturnsZero() throws Exception {
         onMaster.call("SET", "k", "v");
         assertEquals(0L, onMaster.call("WAIT", "0", "100"));

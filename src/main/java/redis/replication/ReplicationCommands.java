@@ -15,14 +15,20 @@ import redis.protocol.Resp;
 import redis.server.Session;
 import redis.store.Keyspace;
 
-/** REPLCONF, PSYNC and WAIT. {@code master} is null when this server is itself a replica. */
+/**
+ * REPLCONF, PSYNC, WAIT and ROLE. Exactly one of {@code master}
+ * and {@code link} is set, depending on whether this server is a master or a
+ * replica.
+ */
 public final class ReplicationCommands {
 
     private final ReplicationMaster master;
+    private final MasterLink link;
     private final Keyspace db;
 
-    public ReplicationCommands(ReplicationMaster master, Keyspace db) {
+    public ReplicationCommands(ReplicationMaster master, MasterLink link, Keyspace db) {
         this.master = master;
+        this.link = link;
         this.db = db;
     }
 
@@ -30,6 +36,7 @@ public final class ReplicationCommands {
         table.register("REPLCONF", -2, this::replconf);
         table.register("PSYNC", 3, this::psync);
         table.register("WAIT", 3, Set.of(BLOCKING), this::waitForReplicas);
+        table.register("ROLE", 1, (s, args) -> master != null ? master.role() : link.role());
     }
 
     private byte[] replconf(Session session, List<byte[]> args) {

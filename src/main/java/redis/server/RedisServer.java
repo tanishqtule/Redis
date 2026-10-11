@@ -67,7 +67,7 @@ public final class RedisServer implements AutoCloseable {
         new ServerCommands(config, db, replication != null ? replication::info : masterLink::info)
                 .registerAll(commands);
         new KeyCommands(db).registerAll(commands);
-        new ReplicationCommands(replication, db).registerAll(commands);
+        new ReplicationCommands(replication, masterLink, db).registerAll(commands);
     }
 
     public void start() throws IOException {

@@ -37,10 +37,23 @@ public final class MasterLink implements Runnable {
     private final Keyspace db;
     private final CommandTable commands;
 
+    /** Link states, named as Redis' ROLE command reports them. */
+    private enum State {
+        CONNECT, CONNECTING, HANDSHAKE, SYNC, CONNECTED;
+
+        String label() {
+            return name().toLowerCase();
+        }
+    }
+
     private volatile boolean running = true;
-    private volatile boolean linkUp;
-    /** Bytes of the stream applied since the last full sync. Reported to the master in ACKs. */
-    private volatile long processed;
+    private volatile State state = State.CONNECT;
+    /**
+     * How far into the master's replication stream we've applied, in the
+     * master's own numbering: it starts from the offset in the FULLRESYNC
+     * reply, not from zero. -1 until the first sync.
+     */
+    private volatile long offset = -1;
     private volatile Socket socket;
 
     public MasterLink(String host, int port, IntSupplier listeningPort,
@@ -63,7 +76,7 @@ public final class MasterLink implements Runnable {
                     log.warning("replication link to " + host + ":" + port + " failed: " + e.getMessage());
                 }
             } finally {
-                linkUp = false;
+                state = State.CONNECT;
             }
             if (running) {
                 try {
@@ -83,30 +96,51 @@ public final class MasterLink implements Runnable {
         }
     }
 
+    public boolean isLinkUp() {
+        return state == State.CONNECTED;
+    }
+
+    public long offset() {
+        return offset;
+    }
+
     public List<String> info() {
         List<String> lines = new ArrayList<>();
         lines.add("role:slave");
         lines.add("master_host:" + host);
         lines.add("master_port:" + port);
-        lines.add("master_link_status:" + (linkUp ? "up" : "down"));
-        lines.add("slave_repl_offset:" + processed);
+        lines.add("master_link_status:" + (isLinkUp() ? "up" : "down"));
+        lines.add("slave_repl_offset:" + offset);
         lines.add("connected_slaves:0");
         return lines;
+    }
+
+    /** ROLE reply, in the same shape Redis uses: slave, host, port, link state, offset. */
+    public byte[] role() {
+        return Resp.array(List.of(
+                Resp.bulk("slave"),
+                Resp.bulk(host),
+                Resp.integer(port),
+                Resp.bulk(state.label()),
+                Resp.integer(offset)));
     }
 
     private void syncAndFollow() throws IOException {
         try (Socket s = new Socket()) {
             socket = s;
+            state = State.CONNECTING;
             s.connect(new InetSocketAddress(host, port), 5000);
             s.setTcpNoDelay(true);
             RespReader reader = new RespReader(s.getInputStream());
             OutputStream out = new BufferedOutputStream(s.getOutputStream());
 
-            handshake(reader, out);
+            state = State.HANDSHAKE;
+            long startOffset = handshake(reader, out);
+            state = State.SYNC;
             loadSnapshot(reader.readRdbPayload());
-            processed = 0;
-            linkUp = true;
-            log.info("synced with master " + host + ":" + port);
+            advanceTo(startOffset);
+            state = State.CONNECTED;
+            log.info("synced with master " + host + ":" + port + " at offset " + startOffset);
 
             Thread acker = Thread.ofVirtual().name("replica-acker").start(() -> ackPeriodically(out));
             try {
@@ -117,7 +151,8 @@ public final class MasterLink implements Runnable {
         }
     }
 
-    private void handshake(RespReader reader, OutputStream out) throws IOException {
+    /** Returns the offset the master says the snapshot corresponds to. */
+    private long handshake(RespReader reader, OutputStream out) throws IOException {
         send(out, Resp.command("PING"));
         reader.readSimpleString();
         send(out, Resp.command("REPLCONF", "listening-port", Integer.toString(listeningPort.getAsInt())));
@@ -126,8 +161,14 @@ public final class MasterLink implements Runnable {
         reader.readSimpleString();
         send(out, Resp.command("PSYNC", "?", "-1"));
         String reply = reader.readSimpleString();
-        if (!reply.startsWith("FULLRESYNC")) {
-            throw new IOException("expected FULLRESYNC, master said: " + reply);
+        String[] parts = reply.split(" ");
+        if (parts.length != 3 || !parts[0].equals("FULLRESYNC")) {
+            throw new IOException("expected FULLRESYNC <replid> <offset>, master said: " + reply);
+        }
+        try {
+            return Long.parseLong(parts[2]);
+        } catch (NumberFormatException e) {
+            throw new IOException("bad offset in FULLRESYNC reply: " + reply);
         }
     }
 
@@ -156,8 +197,12 @@ public final class MasterLink implements Runnable {
                 // Replies to the master's stream are thrown away, as in Redis.
                 commands.dispatch(fromMaster, args);
             }
-            processed += reader.consumed() - before;
+            advanceTo(offset + reader.consumed() - before);
         }
+    }
+
+    private void advanceTo(long newOffset) {
+        offset = newOffset;
     }
 
     // Real masters drop replicas that stay quiet for repl-timeout (60 s), so
@@ -174,7 +219,7 @@ public final class MasterLink implements Runnable {
     }
 
     private byte[] ack() {
-        return Resp.command("REPLCONF", "ACK", Long.toString(processed));
+        return Resp.command("REPLCONF", "ACK", Long.toString(offset));
     }
 
     private static boolean isGetAck(List<byte[]> args) {

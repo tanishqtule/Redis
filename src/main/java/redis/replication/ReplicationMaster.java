@@ -134,13 +134,29 @@ public final class ReplicationMaster {
         lines.add("connected_slaves:" + replicas.size());
         int i = 0;
         for (ReplicaHandle replica : replicas) {
-            String ip = replica.session.peer().replaceFirst("^/", "").replaceFirst(":\\d+$", "");
-            lines.add("slave" + i++ + ":ip=" + ip + ",port=" + replica.session.listeningPort()
+            lines.add("slave" + i++ + ":ip=" + ipOf(replica) + ",port=" + replica.session.listeningPort()
                     + ",state=online,offset=" + replica.ackedOffset());
         }
         lines.add("master_replid:" + replId);
         lines.add("master_repl_offset:" + offset);
         return lines;
+    }
+
+    /** ROLE reply, shaped like Redis': master, offset, then [ip, port, acked offset] per replica. */
+    public byte[] role() {
+        List<byte[]> entries = new ArrayList<>();
+        for (ReplicaHandle replica : replicas) {
+            entries.add(Resp.array(List.of(
+                    Resp.bulk(ipOf(replica)),
+                    Resp.bulk(Integer.toString(replica.session.listeningPort())),
+                    Resp.bulk(Long.toString(replica.ackedOffset())))));
+        }
+        return Resp.array(List.of(Resp.bulk("master"), Resp.integer(offset), Resp.array(entries)));
+    }
+
+    private static String ipOf(ReplicaHandle replica) {
+        // peer() looks like "/127.0.0.1:53412".
+        return replica.session.peer().replaceFirst("^/", "").replaceFirst(":\\d+$", "");
     }
 
     private int caughtUp(long target) {
