@@ -1,0 +1,21 @@
+# A master and one replica. Try:
+#   redis-cli -p 6379 set hello world
+#   redis-cli -p 6380 get hello
+services:
+  master:
+    build: .
+    ports:
+      - "6379:6379"
+    volumes:
+      - master-data:/data
+
+  replica:
+    build: .
+    command: ["--port", "6380", "--replicaof", "master 6379"]
+    ports:
+      - "6380:6380"
+    depends_on:
+      - master
+
+volumes:
+  master-data:
