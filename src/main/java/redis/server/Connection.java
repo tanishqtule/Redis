@@ -4,6 +4,7 @@ import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.List;
 import java.util.function.Consumer;
 import java.util.logging.Level;
@@ -19,13 +20,22 @@ final class Connection implements Runnable {
 
     private static final Logger log = Logger.getLogger(Connection.class.getName());
 
+    /** Before AUTH a client can't send more than this, so it can't make us buffer much. */
+    private static final int UNAUTHENTICATED_MAX_ARGS = 10;
+    private static final int UNAUTHENTICATED_MAX_BULK = 16 * 1024;
+    private static final int MAX_ARGS = 1024 * 1024;
+
     private final Socket socket;
     private final CommandTable commands;
+    private final Config config;
+    private final Consumer<Session> onOpen;
     private final Consumer<Session> onClose;
 
-    Connection(Socket socket, CommandTable commands, Consumer<Session> onClose) {
+    Connection(Socket socket, CommandTable commands, Config config, Consumer<Session> onOpen, Consumer<Session> onClose) {
         this.socket = socket;
         this.commands = commands;
+        this.config = config;
+        this.onOpen = onOpen;
         this.onClose = onClose;
     }
 
@@ -34,12 +44,19 @@ final class Connection implements Runnable {
         Session session = null;
         try (socket) {
             socket.setTcpNoDelay(true);
+            socket.setSoTimeout(config.timeoutSeconds() * 1000);
             RespReader reader = new RespReader(socket.getInputStream());
             OutputStream out = new BufferedOutputStream(socket.getOutputStream());
             session = new Session(socket.getRemoteSocketAddress().toString(), out, false);
             session.setCloser(this::closeQuietly);
+            onOpen.accept(session);
 
             while (!session.closeRequested()) {
+                if (session.authenticated() || config.requirePass() == null) {
+                    reader.setLimits(MAX_ARGS, config.protoMaxBulkLen(), false);
+                } else {
+                    reader.setLimits(UNAUTHENTICATED_MAX_ARGS, UNAUTHENTICATED_MAX_BULK, true);
+                }
                 List<byte[]> args;
                 try {
                     args = reader.readCommand();
@@ -57,8 +74,12 @@ final class Connection implements Runnable {
                     continue;
                 }
 
+                session.commandStarted(args.get(0));
                 byte[] reply = commands.dispatch(session, args);
                 if (session.isReplica()) {
+                    // The replication stream is long-lived and the replica acks on
+                    // its own schedule, so the idle timeout doesn't apply to it.
+                    socket.setSoTimeout(0);
                     // The replication writer owns the socket's output from here on.
                     continue;
                 }
@@ -70,6 +91,8 @@ final class Connection implements Runnable {
                     out.flush();
                 }
             }
+        } catch (SocketTimeoutException e) {
+            log.log(Level.FINE, "closing idle connection");
         } catch (IOException e) {
             log.log(Level.FINE, "connection dropped", e);
         } finally {

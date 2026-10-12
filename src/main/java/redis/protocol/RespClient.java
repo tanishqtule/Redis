@@ -41,6 +41,19 @@ public final class RespClient implements AutoCloseable {
         }
     }
 
+    /** Connects and, when {@code password} isn't null, authenticates. A refused password is an IOException. */
+    public static RespClient connect(String host, int port, int timeoutMillis, String password) throws IOException {
+        RespClient client = new RespClient(host, port, timeoutMillis);
+        if (password != null) {
+            Object reply = client.call("AUTH", password);
+            if (!"OK".equals(reply)) {
+                client.close();
+                throw new IOException("AUTH to " + host + ":" + port + " failed: " + reply);
+            }
+        }
+        return client;
+    }
+
     public Object call(String... args) throws IOException {
         send(args);
         return read();

@@ -39,6 +39,7 @@ public final class CommandTable {
     private final ReentrantLock lock;
     private final boolean readOnly;
 
+    private boolean authRequired;
     private Consumer<List<byte[]>> replicationSink = args -> { };
     /** Run before reads on connections that asked for linearizable reads. Only replicas set one. */
     private Runnable linearizableReadBarrier;
@@ -62,6 +63,11 @@ public final class CommandTable {
         register(name, arity, Set.of(), handler);
     }
 
+    /** With a password set, everything but AUTH and QUIT needs an authenticated connection. */
+    public void setAuthRequired(boolean required) {
+        this.authRequired = required;
+    }
+
     /**
      * Installs the check a replica runs before a linearizable read. It either
      * returns once the replica is caught up, or throws a CommandException.
@@ -77,6 +83,11 @@ public final class CommandTable {
 
     public byte[] dispatch(Session session, List<byte[]> args) {
         String name = Args.upper(args.get(0));
+        if (authRequired && !session.authenticated() && !session.isFromMaster()
+                && !name.equals("AUTH") && !name.equals("QUIT")) {
+            // Checked first, so an anonymous client learns nothing, not even which commands exist.
+            return Resp.error("NOAUTH Authentication required.");
+        }
         Command command = commands.get(name);
 
         String problem = null;

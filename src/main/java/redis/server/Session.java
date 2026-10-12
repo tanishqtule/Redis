@@ -11,6 +11,9 @@ public final class Session {
     private static final AtomicLong ids = new AtomicLong();
 
     private final long id = ids.incrementAndGet();
+    private final long createdAt = System.currentTimeMillis();
+    private volatile long lastActiveAt = createdAt;
+    private volatile String lastCommand = "NULL";
     private final String peer;
     private final OutputStream out;
     private final boolean fromMaster;
@@ -23,6 +26,7 @@ public final class Session {
     private boolean replica;
     private volatile int listeningPort;
     private String name = "";
+    private boolean authenticated;
     private boolean linearizableReads;
     private volatile Runnable closer = () -> { };
 
@@ -34,6 +38,34 @@ public final class Session {
 
     public long id() {
         return id;
+    }
+
+    public long createdAt() {
+        return createdAt;
+    }
+
+    public long lastActiveAt() {
+        return lastActiveAt;
+    }
+
+    public String lastCommand() {
+        return lastCommand;
+    }
+
+    /**
+     * Bookkeeping for CLIENT LIST: when this client last did something, and
+     * what. The name is client-supplied, so it's cut short and stripped of
+     * anything that could break the line-per-client output.
+     */
+    public void commandStarted(byte[] name) {
+        lastActiveAt = System.currentTimeMillis();
+        int length = Math.min(name.length, 32);
+        char[] chars = new char[length];
+        for (int i = 0; i < length; i++) {
+            int c = name[i] & 0xff;
+            chars[i] = c > ' ' && c < 0x7f ? Character.toLowerCase((char) c) : '?';
+        }
+        lastCommand = new String(chars);
     }
 
     public String peer() {
@@ -56,6 +88,15 @@ public final class Session {
 
     public void setName(String name) {
         this.name = name;
+    }
+
+    /** Whether this client has passed AUTH. Only matters when the server has a password. */
+    public boolean authenticated() {
+        return authenticated;
+    }
+
+    public void setAuthenticated(boolean authenticated) {
+        this.authenticated = authenticated;
     }
 
     /** CLIENT CONSISTENCY LINEARIZABLE: on a replica, reads wait until they're sure to be up to date. */

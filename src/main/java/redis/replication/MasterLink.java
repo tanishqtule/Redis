@@ -19,6 +19,7 @@ import redis.command.CommandTable;
 import redis.persistence.Rdb;
 import redis.protocol.Resp;
 import redis.protocol.RespReader;
+import redis.server.Config;
 import redis.server.Logs;
 import redis.server.Session;
 import redis.store.Keyspace;
@@ -37,6 +38,7 @@ public final class MasterLink implements Runnable {
 
     private final String host;
     private final int port;
+    private final String masterAuth;
     private final IntSupplier listeningPort;
     private final ReentrantLock commandLock;
     private final Keyspace db;
@@ -69,15 +71,16 @@ public final class MasterLink implements Runnable {
     private final Object progress = new Object();
     private volatile int waiters;
 
-    public MasterLink(String host, int port, IntSupplier listeningPort,
+    public MasterLink(Config config, IntSupplier listeningPort,
                       ReentrantLock commandLock, Keyspace db, CommandTable commands) {
-        this.host = host;
-        this.port = port;
+        this.host = config.masterHost();
+        this.port = config.masterPort();
+        this.masterAuth = config.masterAuth();
         this.listeningPort = listeningPort;
         this.commandLock = commandLock;
         this.db = db;
         this.commands = commands;
-        this.readIndex = new ReadIndex(host, port, LINEARIZABLE_READ_TIMEOUT_MS);
+        this.readIndex = new ReadIndex(host, port, LINEARIZABLE_READ_TIMEOUT_MS, masterAuth);
     }
 
     @Override
@@ -250,6 +253,10 @@ public final class MasterLink implements Runnable {
 
     /** Returns the offset the master says the snapshot corresponds to. */
     private long handshake(RespReader reader, OutputStream out) throws IOException {
+        if (masterAuth != null) {
+            send(out, Resp.command("AUTH", masterAuth));
+            reader.readSimpleString();
+        }
         send(out, Resp.command("PING"));
         reader.readSimpleString();
         send(out, Resp.command("REPLCONF", "listening-port", Integer.toString(listeningPort.getAsInt())));

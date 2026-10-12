@@ -1,14 +1,19 @@
 package redis.command;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
+import java.util.logging.Logger;
 
 import redis.persistence.Rdb;
 import redis.protocol.Resp;
@@ -20,7 +25,11 @@ import redis.store.Keyspace;
 /** Connection and server-level commands: PING, ECHO, CONFIG, SAVE, ... */
 public final class ServerCommands {
 
+    private static final Logger log = Logger.getLogger(ServerCommands.class.getName());
+
     private final Config config;
+    private final AtomicLong authFailures = new AtomicLong();
+    private long lastAuthWarning;
     private final Keyspace db;
     private final Supplier<List<String>> replicationInfo;
     private final long startedAt = System.currentTimeMillis();
@@ -42,6 +51,7 @@ public final class ServerCommands {
         table.register("SAVE", 1, this::save);
         table.register("INFO", -1, this::info);
         table.register("CLIENT", -2, this::client);
+        table.register("AUTH", -2, this::auth);
         // Only database 0 exists. Accepting SELECT 0 matters because a real
         // master starts its replication stream with it.
         table.register("SELECT", 2, (s, args) -> {
@@ -50,6 +60,50 @@ public final class ServerCommands {
             }
             return Resp.OK;
         });
+    }
+
+    /** AUTH password, or AUTH default password (the Redis 6 form; "default" is the only user). */
+    private byte[] auth(Session session, List<byte[]> args) {
+        if (args.size() > 3) {
+            throw CommandException.syntax();
+        }
+        String expected = config.requirePass();
+        if (expected == null) {
+            throw new CommandException("ERR AUTH <password> called without any password configured for the default user."
+                    + " Are you sure your configuration is correct?");
+        }
+        boolean userOk = args.size() == 2 || Args.str(args, 1).equals("default");
+        boolean passwordOk = sameSecret(args.get(args.size() - 1), expected.getBytes(StandardCharsets.UTF_8));
+        if (!(userOk & passwordOk)) {
+            long failures = authFailures.incrementAndGet();
+            long now = System.currentTimeMillis();
+            if (now - lastAuthWarning > 10_000) {
+                lastAuthWarning = now;
+                log.warning("failed AUTH from " + session.peer() + " (" + failures + " failures so far)");
+            }
+            throw new CommandException("WRONGPASS invalid username-password pair or user is disabled.");
+        }
+        session.setAuthenticated(true);
+        return Resp.OK;
+    }
+
+    public long authFailures() {
+        return authFailures.get();
+    }
+
+    /**
+     * Compares in constant time. Hashing first gives both sides the same
+     * length, so not even the password's length leaks through timing.
+     */
+    private static boolean sameSecret(byte[] given, byte[] expected) {
+        try {
+            MessageDigest sha = MessageDigest.getInstance("SHA-256");
+            byte[] a = sha.digest(given);
+            byte[] b = sha.digest(expected);
+            return MessageDigest.isEqual(a, b);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is always available", e);
+        }
     }
 
     private byte[] client(Session session, List<byte[]> args) {

@@ -34,6 +34,7 @@ final class ReadIndex implements AutoCloseable {
     private final String host;
     private final int port;
     private final int timeoutMillis;
+    private final String password;
 
     private final Object lock = new Object();
     /** Callers waiting for a request that hasn't been sent yet. Guarded by lock. */
@@ -44,10 +45,11 @@ final class ReadIndex implements AutoCloseable {
     private volatile RespClient master;
     private final AtomicLong roundTrips = new AtomicLong();
 
-    ReadIndex(String host, int port, int timeoutMillis) {
+    ReadIndex(String host, int port, int timeoutMillis, String password) {
         this.host = host;
         this.port = port;
         this.timeoutMillis = timeoutMillis;
+        this.password = password;
     }
 
     /** Returns a position the master had reached at some point after this call began. */
@@ -104,7 +106,7 @@ final class ReadIndex implements AutoCloseable {
         try {
             RespClient client = master;
             if (client == null) {
-                client = new RespClient(host, port, timeoutMillis);
+                client = RespClient.connect(host, port, timeoutMillis, password);
                 master = client;
             }
             Object reply = client.call("INFO", "replication");

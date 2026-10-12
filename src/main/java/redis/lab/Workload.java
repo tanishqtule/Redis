@@ -42,7 +42,11 @@ public final class Workload {
         }
     }
 
-    public record Settings(int clients, int opsPerClient, int registers, int counters, long seed) {
+    /** @param password for AUTH on every connection, or null */
+    public record Settings(int clients, int opsPerClient, int registers, int counters, long seed, String password) {
+        public Settings(int clients, int opsPerClient, int registers, int counters, long seed) {
+            this(clients, opsPerClient, registers, counters, seed, null);
+        }
     }
 
     /** @param failedReads reads that came back as errors (say TRYAGAIN); they changed nothing so they're left out */
@@ -98,8 +102,8 @@ public final class Workload {
         List<Op> ops = new ArrayList<>();
         int failedReads = 0;
         int written = 0;
-        try (RespClient writer = new RespClient(master.host(), master.port(), 10_000);
-             RespClient reader = new RespClient(reads.host(), reads.port(), 10_000)) {
+        try (RespClient writer = RespClient.connect(master.host(), master.port(), 10_000, settings.password());
+             RespClient reader = RespClient.connect(reads.host(), reads.port(), 10_000, settings.password())) {
             if (linearizableReads) {
                 Object reply = reader.call("CLIENT", "CONSISTENCY", "LINEARIZABLE");
                 if (reply instanceof RespError) {
@@ -149,7 +153,7 @@ public final class Workload {
     }
 
     private static void cleanUp(Endpoint master, String prefix, Settings settings) {
-        try (RespClient c = new RespClient(master.host(), master.port(), 10_000)) {
+        try (RespClient c = RespClient.connect(master.host(), master.port(), 10_000, settings.password())) {
             for (int i = 0; i < settings.registers(); i++) {
                 c.call("DEL", prefix + "reg" + i);
             }

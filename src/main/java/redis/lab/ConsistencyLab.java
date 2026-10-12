@@ -39,6 +39,7 @@ public final class ConsistencyLab {
         Endpoint replica = null;
         int clients = 8;
         int ops = 300;
+        String password = System.getenv("REDIS_PASSWORD");
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--master" -> master = Endpoint.parse(args[++i]);
@@ -47,7 +48,7 @@ public final class ConsistencyLab {
                 case "--ops" -> ops = Integer.parseInt(args[++i]);
                 default -> {
                     System.err.println("usage: ConsistencyLab --master host:port [--replica host:port]"
-                            + " [--clients N] [--ops N-per-client]");
+                            + " [--clients N] [--ops N-per-client]   (password, if any, from $REDIS_PASSWORD)");
                     System.exit(2);
                 }
             }
@@ -56,7 +57,9 @@ public final class ConsistencyLab {
             System.err.println("--master is required");
             System.exit(2);
         }
-        List<Outcome> outcomes = runAll(master, replica, new Settings(clients, ops, 3, 1, System.nanoTime()));
+        System.err.println("note: the lab writes and then deletes its own keys (lab:<random>:*) on the target."
+                + " Don't point it at data you care about.");
+        List<Outcome> outcomes = runAll(master, replica, new Settings(clients, ops, 3, 1, System.nanoTime(), password));
         print(outcomes, System.out);
         boolean masterOk = outcomes.get(0).result() != null
                 && outcomes.get(0).result().verdict() == Verdict.LINEARIZABLE;
@@ -69,9 +72,9 @@ public final class ConsistencyLab {
         outcomes.add(scenario("master only", master, master, false, settings));
         if (replica != null) {
             outcomes.add(scenario("replica, default reads", master, replica, false, settings));
-            long before = roundTrips(replica);
+            long before = roundTrips(replica, settings.password());
             Outcome linearizable = scenario("replica, CLIENT CONSISTENCY LINEARIZABLE", master, replica, true, settings);
-            long after = roundTrips(replica);
+            long after = roundTrips(replica, settings.password());
             if (linearizable.run() != null && before >= 0 && after >= 0) {
                 long reads = linearizable.run().history().stream().filter(Op::isRead).count();
                 linearizable = new Outcome(linearizable.scenario(), linearizable.run(), linearizable.result(),
@@ -96,8 +99,8 @@ public final class ConsistencyLab {
     }
 
     /** read_index_round_trips from a redis-java replica's INFO, or -1 for servers that don't report it. */
-    private static long roundTrips(Endpoint replica) {
-        try (RespClient c = new RespClient(replica.host(), replica.port(), 5_000)) {
+    private static long roundTrips(Endpoint replica, String password) {
+        try (RespClient c = RespClient.connect(replica.host(), replica.port(), 5_000, password)) {
             Object info = c.call("INFO", "replication");
             if (info instanceof String text) {
                 for (String line : text.split("\r\n")) {
