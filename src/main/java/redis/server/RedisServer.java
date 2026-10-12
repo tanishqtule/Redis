@@ -224,18 +224,27 @@ public final class RedisServer implements AutoCloseable {
             return true;
         }
         boolean wantSave = save != null ? save : !config.saveRules().isEmpty();
-        if (wantSave) {
-            try {
-                persistence.saveWhenIdle(60_000);
-            } catch (IOException e) {
-                log.severe("not shutting down: the final save failed: " + e.getMessage());
-                return false;
-            }
-        }
+        // No command may run between the final snapshot and closing the
+        // connections, or a write could be acknowledged and then lost with
+        // the process. Holding the command lock throughout gives the same
+        // guarantee Redis gets from being single-threaded.
+        lock.lock();
         try {
-            close();
-        } catch (IOException e) {
-            log.warning("error while closing: " + e.getMessage());
+            if (wantSave) {
+                try {
+                    persistence.saveWhenIdle(60_000);
+                } catch (IOException e) {
+                    log.severe("not shutting down: the final save failed: " + e.getMessage());
+                    return false;
+                }
+            }
+            try {
+                close();
+            } catch (IOException e) {
+                log.warning("error while closing: " + e.getMessage());
+            }
+        } finally {
+            lock.unlock();
         }
         log.info("redis-java is now ready to exit, bye bye...");
         return true;
@@ -334,6 +343,15 @@ public final class RedisServer implements AutoCloseable {
                 reject(socket, TOO_MANY_CLIENTS);
             } else {
                 clients.add(socket);
+                if (closed.get()) {
+                    // close() may have gone through the clients before this one was added.
+                    try {
+                        socket.close();
+                    } catch (IOException ignored) {
+                        // closing anyway
+                    }
+                    continue;
+                }
                 Thread.ofVirtual().name("client-" + socket.getPort()).start(
                         new Connection(socket, commands, config, this::onConnect, s -> onDisconnect(socket, s)));
             }

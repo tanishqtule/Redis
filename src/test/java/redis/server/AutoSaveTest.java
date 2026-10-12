@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -108,35 +109,117 @@ class AutoSaveTest {
         }
     }
 
-    /** The real thing: a separate JVM, stopped with SIGTERM like docker stop does. */
+    /**
+     * No write may be acknowledged after the final snapshot is taken: one
+     * that is would be confirmed to its client and then lost.
+     */
     @Test
-    void sigtermSavesBeforeExiting(@TempDir Path dir) throws Exception {
-        String java = ProcessHandle.current().info().command().orElse("java");
-        int port;
-        try (java.net.ServerSocket probe = new java.net.ServerSocket(0)) {
-            port = probe.getLocalPort();
+    void shutdownKeepsEveryAcknowledgedWrite(@TempDir Path dir) throws Exception {
+        RedisServer server = new RedisServer(config(dir));
+        server.start();
+        AtomicLong lastAcknowledged = new AtomicLong();
+        Thread writer = new Thread(() -> {
+            try (RespClient c = new RespClient(server.port())) {
+                for (long i = 1; ; i++) {
+                    if (!"OK".equals(c.call("SET", "counter", Long.toString(i)))) {
+                        return;
+                    }
+                    lastAcknowledged.set(i);
+                }
+            } catch (IOException connectionClosed) {
+                // the server went away, as expected
+            }
+        });
+        writer.start();
+        while (lastAcknowledged.get() < 1000) {
+            Thread.sleep(1);
         }
-        Process server = new ProcessBuilder(java, "-cp", System.getProperty("java.class.path"), "redis.Main",
-                "--port", Integer.toString(port), "--dir", dir.toString())
-                .redirectErrorStream(true).redirectOutput(dir.resolve("server.log").toFile()).start();
-        try {
-            RespClient c = null;
-            for (int i = 0; i < 100 && c == null; i++) {
-                try {
-                    c = new RespClient(port);
+        try (RespClient c = new RespClient(server.port())) {
+            c.send("SHUTDOWN", "SAVE");
+            assertThrows(IOException.class, c::read);
+        }
+        writer.join(10_000);
+        long saved = Long.parseLong(load(dir.resolve("dump.rdb")).get("counter"));
+        assertTrue(saved >= lastAcknowledged.get(),
+                "acknowledged up to " + lastAcknowledged.get() + " but only " + saved + " was saved");
+    }
+
+    /** A server in its own JVM, so it can be sent real signals. */
+    private record ServerProcess(Process process, int port, Path log) {
+
+        static ServerProcess start(Path dataDir, Path log) throws Exception {
+            String java = ProcessHandle.current().info().command().orElse("java");
+            int port;
+            try (java.net.ServerSocket probe = new java.net.ServerSocket(0)) {
+                port = probe.getLocalPort();
+            }
+            Process process = new ProcessBuilder(java, "-cp", System.getProperty("java.class.path"), "redis.Main",
+                    "--port", Integer.toString(port), "--dir", dataDir.toString())
+                    .redirectErrorStream(true).redirectOutput(log.toFile()).start();
+            ServerProcess server = new ServerProcess(process, port, log);
+            for (int i = 0; i < 100; i++) {
+                try (RespClient c = new RespClient(port)) {
+                    return server;
                 } catch (IOException notYet) {
                     Thread.sleep(100);
                 }
             }
-            assertTrue(c != null, "server didn't start: " + Files.readString(dir.resolve("server.log")));
-            c.call("SET", "survives", "sigterm");
-            c.close();
-            server.destroy(); // SIGTERM on Unix
-            assertTrue(server.waitFor(20, TimeUnit.SECONDS), "server didn't exit");
-        } finally {
-            server.destroyForcibly();
+            process.destroyForcibly();
+            throw new AssertionError("server didn't start: " + Files.readString(log));
         }
-        assertEquals(Map.of("survives", "sigterm"), load(dir.resolve("dump.rdb")),
-                Files.readString(dir.resolve("server.log")));
+
+        Object call(String... args) throws IOException {
+            try (RespClient c = new RespClient(port)) {
+                return c.call(args);
+            }
+        }
+
+        String output() throws IOException {
+            return Files.readString(log);
+        }
+    }
+
+    /** The real thing: a separate JVM, stopped with SIGTERM like docker stop does. */
+    @Test
+    void sigtermSavesBeforeExiting(@TempDir Path dir) throws Exception {
+        ServerProcess server = ServerProcess.start(dir, dir.resolve("server.log"));
+        try {
+            server.call("SET", "survives", "sigterm");
+            server.process().destroy(); // SIGTERM on Unix
+            assertTrue(server.process().waitFor(20, TimeUnit.SECONDS), "server didn't exit");
+        } finally {
+            server.process().destroyForcibly();
+        }
+        String log = server.output();
+        assertEquals(Map.of("survives", "sigterm"), load(dir.resolve("dump.rdb")), log);
+        // A clean stop exits 0, as Redis does, and what it logged on the way out isn't lost.
+        assertEquals(0, server.process().exitValue(), log);
+        assertTrue(log.contains("saved 1 keys") && log.contains("ready to exit"), log);
+    }
+
+    /**
+     * If the final save fails, SIGTERM leaves the server running rather than
+     * lose the data, and the next SIGTERM tries again.
+     */
+    @Test
+    void sigtermKeepsRunningWhenTheSaveFailsAndTriesAgainNextTime(@TempDir Path dir) throws Exception {
+        Path dataDir = dir.resolve("data");
+        Files.writeString(dataDir, "a file where the data directory should be");
+        ServerProcess server = ServerProcess.start(dataDir, dir.resolve("server.log"));
+        try {
+            server.call("SET", "k", "v");
+            server.process().destroy();
+            assertFalse(server.process().waitFor(2, TimeUnit.SECONDS), "exited without saving: " + server.output());
+            assertEquals("v", server.call("GET", "k"));
+            assertTrue(server.output().contains("errors trying to shut down"), server.output());
+
+            Files.delete(dataDir); // the operator fixes the problem
+            server.process().destroy();
+            assertTrue(server.process().waitFor(20, TimeUnit.SECONDS), "didn't exit: " + server.output());
+            assertEquals(0, server.process().exitValue(), server.output());
+        } finally {
+            server.process().destroyForcibly();
+        }
+        assertEquals(Map.of("k", "v"), load(dataDir.resolve("dump.rdb")), server.output());
     }
 }

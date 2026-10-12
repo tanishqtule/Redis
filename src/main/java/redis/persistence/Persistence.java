@@ -10,6 +10,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Logger;
 
@@ -36,8 +37,12 @@ public final class Persistence {
     private final Keyspace db;
     private final AtomicBoolean inProgress = new AtomicBoolean();
 
-    /** Writes since the last successful save. Guarded by the command lock. */
-    private long dirty;
+    /**
+     * Writes since the last successful save. Atomic rather than guarded by
+     * the command lock so that a background save can finish while someone
+     * else holds the lock, which the final save at shutdown relies on.
+     */
+    private final AtomicLong dirty = new AtomicLong();
     private long dirtyAtSnapshot;
     private volatile long lastSaveAt = System.currentTimeMillis();
     private volatile long lastAttemptAt;
@@ -50,9 +55,9 @@ public final class Persistence {
         this.db = db;
     }
 
-    /** Records writes. Caller holds the command lock. */
+    /** Records writes. */
     public void changed(long count) {
-        dirty += count;
+        dirty.addAndGet(count);
     }
 
     /** SAVE: snapshot now and return once it's on disk. Fails if another save is running. */
@@ -67,7 +72,10 @@ public final class Persistence {
         }
     }
 
-    /** Like save(), but waits for a running save to finish first. Used at shutdown. */
+    /**
+     * Like save(), but waits for a running save to finish first. Used at
+     * shutdown, by a caller that holds the command lock throughout.
+     */
     public void saveWhenIdle(long timeoutMillis) throws IOException {
         long deadline = System.currentTimeMillis() + timeoutMillis;
         while (!inProgress.compareAndSet(false, true)) {
@@ -116,13 +124,7 @@ public final class Persistence {
             return;
         }
         long elapsedSeconds = (now - lastSaveAt) / 1000;
-        long changes;
-        commandLock.lock();
-        try {
-            changes = dirty;
-        } finally {
-            commandLock.unlock();
-        }
+        long changes = dirty.get();
         for (Config.SaveRule rule : config.saveRules()) {
             if (changes >= rule.changes() && elapsedSeconds >= rule.seconds()) {
                 log.info(changes + " changes in " + elapsedSeconds + " seconds. Saving...");
@@ -144,7 +146,7 @@ public final class Persistence {
     public List<String> info() {
         List<String> lines = new ArrayList<>();
         lines.add("loading:0");
-        lines.add("rdb_changes_since_last_save:" + dirty);
+        lines.add("rdb_changes_since_last_save:" + dirty.get());
         lines.add("rdb_bgsave_in_progress:" + (inProgress.get() ? 1 : 0));
         lines.add("rdb_last_save_time:" + lastSaveSeconds());
         lines.add("rdb_last_bgsave_status:" + (lastSaveOk ? "ok" : "err"));
@@ -156,7 +158,7 @@ public final class Persistence {
     private Keyspace.Snapshot copy() {
         commandLock.lock();
         try {
-            dirtyAtSnapshot = dirty;
+            dirtyAtSnapshot = dirty.get();
             return db.snapshot();
         } finally {
             commandLock.unlock();
@@ -173,13 +175,8 @@ public final class Persistence {
             log.warning("saving " + target + " failed: " + e);
             throw e instanceof IOException io ? io : new IOException(e);
         }
-        commandLock.lock();
-        try {
-            // Writes made while the file was being written still count for the next save.
-            dirty -= dirtyAtSnapshot;
-        } finally {
-            commandLock.unlock();
-        }
+        // Writes made while the file was being written still count for the next save.
+        dirty.addAndGet(-dirtyAtSnapshot);
         lastSaveAt = System.currentTimeMillis();
         lastSaveOk = true;
         saves++;
