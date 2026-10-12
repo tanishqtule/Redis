@@ -78,7 +78,7 @@ public final class RedisServer implements AutoCloseable {
         config.validate();
         this.config = config;
         this.tls = Tls.fromConfig(config);
-        this.commands = new CommandTable(lock, config.isReplica());
+        this.commands = new CommandTable(lock, db, config.isReplica());
         commands.setAuthRequired(config.requirePass() != null);
         this.persistence = new Persistence(config, lock, db);
         commands.setWriteListener(() -> persistence.changed(1));
@@ -419,6 +419,7 @@ public final class RedisServer implements AutoCloseable {
     private void onDisconnect(Socket socket, Session session) {
         clients.remove(socket);
         sessions.remove(session.id());
+        commands.sessionClosed(session);
         closedHits.add(session.keyspaceHits());
         closedMisses.add(session.keyspaceMisses());
         if (replication != null && session.isReplica()) {

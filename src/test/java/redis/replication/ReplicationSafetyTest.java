@@ -60,7 +60,7 @@ class ReplicationSafetyTest {
     private static Setup setup(long outputLimit) {
         ReentrantLock lock = new ReentrantLock();
         Keyspace db = new Keyspace();
-        CommandTable table = new CommandTable(lock, false);
+        CommandTable table = new CommandTable(lock, db, false);
         ReplicationMaster master = new ReplicationMaster(lock, 0, outputLimit);
         new KeyCommands(db, 1 << 20).registerAll(table);
         new ReplicationCommands(master, null, db).registerAll(table);

@@ -311,7 +311,9 @@ public final class ServerCommands {
         if (all || wanted.contains("clients")) {
             section(out, "Clients", List.of(
                     "connected_clients:" + state.sessions().size(),
-                    "maxclients:" + config.maxClients()));
+                    "maxclients:" + config.maxClients(),
+                    "watching_clients:" + state.sessions().stream().filter(s -> !s.watch().isEmpty()).count(),
+                    "total_watched_keys:" + db.watchedKeys()));
         }
         if (all || wanted.contains("memory")) {
             Runtime rt = Runtime.getRuntime();

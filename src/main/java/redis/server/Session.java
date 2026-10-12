@@ -5,6 +5,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
+import redis.store.Keyspace;
+
 /** Per-connection state. Apart from the listening port, only the connection's own thread touches it. */
 public final class Session {
 
@@ -25,6 +27,7 @@ public final class Session {
     private boolean inMulti;
     private boolean multiFailed;
     private final List<List<byte[]>> queued = new ArrayList<>();
+    private final Keyspace.Watch watch = new Keyspace.Watch();
 
     private boolean closeRequested;
     private boolean replica;
@@ -161,6 +164,11 @@ public final class Session {
 
     public void queue(List<byte[]> args) {
         queued.add(args);
+    }
+
+    /** The keys this connection has WATCHed. Only touched under the command lock. */
+    public Keyspace.Watch watch() {
+        return watch;
     }
 
     /** A command failed to queue (unknown name, bad arity); EXEC must then refuse to run anything. */

@@ -21,6 +21,7 @@ import java.util.logging.Logger;
 
 import redis.protocol.Resp;
 import redis.server.Session;
+import redis.store.Keyspace;
 
 /**
  * Looks up commands and runs them, including MULTI/EXEC.
@@ -40,6 +41,7 @@ public final class CommandTable {
 
     private final Map<String, Command> commands = new HashMap<>();
     private final ReentrantLock lock;
+    private final Keyspace db;
     private final boolean readOnly;
 
     private boolean authRequired;
@@ -55,12 +57,19 @@ public final class CommandTable {
     private List<List<byte[]>> execWrites;
 
     /** @param readOnly true on a replica: ordinary clients may not write */
-    public CommandTable(ReentrantLock lock, boolean readOnly) {
+    public CommandTable(ReentrantLock lock, Keyspace db, boolean readOnly) {
         this.lock = lock;
+        this.db = db;
         this.readOnly = readOnly;
         register("MULTI", 1, Set.of(TX_CONTROL), this::multi);
         register("EXEC", 1, Set.of(TX_CONTROL), this::exec);
         register("DISCARD", 1, Set.of(TX_CONTROL), this::discard);
+        // TX_CONTROL so that inside MULTI it's refused instead of queued.
+        register("WATCH", -2, Set.of(TX_CONTROL), this::watch);
+        register("UNWATCH", 1, (session, args) -> {
+            db.unwatch(session.watch());
+            return Resp.OK;
+        });
     }
 
     public void register(String name, int arity, Set<Command.Flag> flags, Command.Handler handler) {
@@ -216,7 +225,33 @@ public final class CommandTable {
             return Resp.error("ERR DISCARD without MULTI");
         }
         session.endMulti();
+        db.unwatch(session.watch());
         return Resp.OK;
+    }
+
+    /** WATCH key [key ...]: EXEC will refuse to run if any of them changes before it. */
+    private byte[] watch(Session session, List<byte[]> args) {
+        if (session.inMulti()) {
+            // Refused, but unlike an unknown command it doesn't doom the transaction (as in Redis).
+            return Resp.error("ERR WATCH inside MULTI is not allowed");
+        }
+        for (int i = 1; i < args.size(); i++) {
+            db.watch(session.watch(), Args.str(args, i));
+        }
+        return Resp.OK;
+    }
+
+    /** Forgets a closed connection's WATCHes, so the keyspace doesn't keep marking them. */
+    public void sessionClosed(Session session) {
+        if (session.watch().isEmpty()) {
+            return;
+        }
+        lock.lock();
+        try {
+            db.unwatch(session.watch());
+        } finally {
+            lock.unlock();
+        }
     }
 
     private byte[] exec(Session session, List<byte[]> args) {
@@ -225,8 +260,14 @@ public final class CommandTable {
         }
         boolean failed = session.multiFailed();
         List<List<byte[]>> queued = session.endMulti();
+        boolean watchedKeyChanged = db.changedSince(session.watch());
+        db.unwatch(session.watch());
         if (failed) {
             return Resp.error("EXECABORT Transaction discarded because of previous errors.");
+        }
+        if (watchedKeyChanged) {
+            // The optimistic lock failed: run nothing, and tell the client with a null reply.
+            return Resp.NULL_ARRAY;
         }
 
         // We already hold the lock (EXEC isn't BLOCKING), so nothing can interleave.

@@ -101,12 +101,28 @@ public final class Keyspace {
         }
     }
 
+    /**
+     * The keys one connection has WATCHed. Any write, delete, expiry or
+     * eviction of one of them marks it, and EXEC then refuses to run.
+     */
+    public static final class Watch {
+        /** Key -> whether it existed when watched; only those can expire afterwards. */
+        private final Map<String, Boolean> keys = new HashMap<>();
+        private boolean touched;
+
+        public boolean isEmpty() {
+            return keys.isEmpty();
+        }
+    }
+
     private final Map<String, Entry> entries = new HashMap<>();
     private final PriorityQueue<Deadline> deadlines = new PriorityQueue<>(Comparator.comparingLong(Deadline::at));
     /** Position -> key, or -> List of keys on the (astronomically rare) collision. */
     private final TreeMap<Long, Object> positions = new TreeMap<>();
     /** The same, for keys with a TTL only, so volatile-* eviction can sample them. */
     private final TreeMap<Long, Object> volatilePositions = new TreeMap<>();
+    /** Watched key -> the watches to mark when it changes. Empty unless someone uses WATCH. */
+    private final Map<String, List<Watch>> watchers = new HashMap<>();
     private final SipHash hasher;
     private final LongSupplier clock;
     private int volatileKeys;
@@ -297,12 +313,62 @@ public final class Keyspace {
     }
 
     public void clear() {
+        watchers.forEach((key, watches) -> {
+            if (entries.containsKey(key)) {
+                watches.forEach(watch -> watch.touched = true);
+            }
+        });
         entries.clear();
         deadlines.clear();
         positions.clear();
         volatilePositions.clear();
         volatileKeys = 0;
         usedMemory = 0;
+    }
+
+    /** WATCH: from now on, any change to {@code key} marks {@code watch}. */
+    public void watch(Watch watch, String key) {
+        if (watch.keys.containsKey(key)) {
+            return;
+        }
+        // lookup() drops a key that has already expired, so that dropping it
+        // later doesn't count as a change. Redis behaves the same way.
+        watch.keys.put(key, lookup(key) != null);
+        watchers.computeIfAbsent(key, k -> new ArrayList<>(1)).add(watch);
+    }
+
+    /** UNWATCH, and what EXEC and DISCARD do once they're done. */
+    public void unwatch(Watch watch) {
+        for (String key : watch.keys.keySet()) {
+            List<Watch> watches = watchers.get(key);
+            watches.remove(watch);
+            if (watches.isEmpty()) {
+                watchers.remove(key);
+            }
+        }
+        watch.keys.clear();
+        watch.touched = false;
+    }
+
+    /** How many distinct keys are being watched, for INFO. */
+    public int watchedKeys() {
+        return watchers.size();
+    }
+
+    /** Whether any watched key was modified, deleted or expired since it was watched. */
+    public boolean changedSince(Watch watch) {
+        if (watch.touched) {
+            return true;
+        }
+        // A key can have expired without anything having removed it yet.
+        long now = now();
+        for (Map.Entry<String, Boolean> watched : watch.keys.entrySet()) {
+            Entry entry = entries.get(watched.getKey());
+            if (watched.getValue() && entry != null && entry.expiredAt(now)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -392,6 +458,7 @@ public final class Keyspace {
     }
 
     private void put(String key, Entry entry) {
+        touch(key);
         Entry old = entries.put(key, entry);
         boolean wasVolatile = old != null && old.expireAt() != NO_EXPIRY;
         boolean isVolatile = entry.expireAt() != NO_EXPIRY;
@@ -424,6 +491,7 @@ public final class Keyspace {
         if (old == null) {
             return false;
         }
+        touch(key);
         long position = position(key);
         unindex(positions, position, key);
         usedMemory -= KEY_OVERHEAD + key.length() + old.value.length;
@@ -433,6 +501,15 @@ public final class Keyspace {
             unindex(volatilePositions, position, key);
         }
         return true;
+    }
+
+    private void touch(String key) {
+        if (!watchers.isEmpty()) {
+            List<Watch> watches = watchers.get(key);
+            if (watches != null) {
+                watches.forEach(watch -> watch.touched = true);
+            }
+        }
     }
 
     private long position(String key) {

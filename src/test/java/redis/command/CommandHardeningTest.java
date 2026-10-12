@@ -15,11 +15,12 @@ import redis.store.Keyspace;
 
 class CommandHardeningTest {
 
-    private final CommandTable table = new CommandTable(new ReentrantLock(), false);
+    private final Keyspace db = new Keyspace();
+    private final CommandTable table = new CommandTable(new ReentrantLock(), db, false);
     private final Session session = new Session("test", OutputStream.nullOutputStream(), false);
 
     CommandHardeningTest() {
-        new KeyCommands(new Keyspace(), 16).registerAll(table);
+        new KeyCommands(db, 16).registerAll(table);
     }
 
     private String call(String... args) {
