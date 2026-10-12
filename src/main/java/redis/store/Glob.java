@@ -1,8 +1,16 @@
 package redis.store;
 
 /**
- * Redis-style glob matching for KEYS: {@code *}, {@code ?}, {@code [abc]},
- * {@code [^a-z]} and backslash escapes.
+ * Redis-style glob matching for KEYS, SCAN and CONFIG GET: {@code *},
+ * {@code ?}, {@code [abc]}, {@code [^a-z]} and backslash escapes.
+ *
+ * Every element except {@code *} matches exactly one character, so when a
+ * match fails it's enough to go back to the most recent star and let it
+ * swallow one more character. Earlier stars never need revisiting, which
+ * bounds the work at pattern length times text length. A recursive matcher
+ * that retries every star is exponential: a 29-character pattern against a
+ * 40-character key hung the server for minutes, the same class of bug as
+ * Redis' CVE-2022-36021.
  */
 public final class Glob {
 
@@ -10,50 +18,50 @@ public final class Glob {
     }
 
     public static boolean matches(String pattern, String text) {
-        return match(pattern, 0, text, 0);
+        int p = 0;
+        int s = 0;
+        int starP = -1;
+        int starS = -1;
+        while (s < text.length()) {
+            if (p < pattern.length()) {
+                if (pattern.charAt(p) == '*') {
+                    starP = p++;
+                    starS = s;
+                    continue;
+                }
+                int next = matchOne(pattern, p, text.charAt(s));
+                if (next >= 0) {
+                    p = next;
+                    s++;
+                    continue;
+                }
+            }
+            if (starP < 0) {
+                return false;
+            }
+            // Let the last star take one more character and try again from there.
+            p = starP + 1;
+            s = ++starS;
+        }
+        while (p < pattern.length() && pattern.charAt(p) == '*') {
+            p++;
+        }
+        return p == pattern.length();
     }
 
-    private static boolean match(String p, int pi, String s, int si) {
-        while (pi < p.length()) {
-            char c = p.charAt(pi);
-            if (c == '*') {
-                while (pi + 1 < p.length() && p.charAt(pi + 1) == '*') {
-                    pi++;
-                }
-                if (pi + 1 == p.length()) {
-                    return true;
-                }
-                for (int k = si; k <= s.length(); k++) {
-                    if (match(p, pi + 1, s, k)) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-            if (si >= s.length()) {
-                return false;
-            }
-            if (c == '?') {
-                pi++;
-                si++;
-            } else if (c == '[') {
-                pi = matchClass(p, pi + 1, s.charAt(si));
-                if (pi < 0) {
-                    return false;
-                }
-                si++;
-            } else {
-                if (c == '\\' && pi + 1 < p.length()) {
-                    c = p.charAt(++pi);
-                }
-                if (s.charAt(si) != c) {
-                    return false;
-                }
-                pi++;
-                si++;
-            }
+    /** If the element at {@code p} matches {@code ch}, the index of the next element; otherwise -1. */
+    private static int matchOne(String pattern, int p, char ch) {
+        char c = pattern.charAt(p);
+        if (c == '?') {
+            return p + 1;
         }
-        return si == s.length();
+        if (c == '[') {
+            return matchClass(pattern, p + 1, ch);
+        }
+        if (c == '\\' && p + 1 < pattern.length()) {
+            return pattern.charAt(p + 1) == ch ? p + 2 : -1;
+        }
+        return c == ch ? p + 1 : -1;
     }
 
     /** Returns the pattern index just past the class, or -1 if {@code ch} isn't in it. */

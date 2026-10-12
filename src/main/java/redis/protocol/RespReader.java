@@ -20,10 +20,20 @@ public final class RespReader {
 
     private static final int MAX_LINE = 64 * 1024;
     private static final int MAX_ARGS = 1024 * 1024;
-    private static final int MAX_BULK = 512 * 1024 * 1024;
+    public static final int DEFAULT_MAX_BULK = 512 * 1024 * 1024;
+    /** Never trust a declared count for an up-front allocation; grow as the data actually arrives. */
+    private static final int INITIAL_CAPACITY_CAP = 64;
+    /** Replies nest only a few levels in practice (ROLE is three deep). */
+    private static final int MAX_REPLY_DEPTH = 64;
 
     private final InputStream in;
     private long consumed;
+    /** Snapshots from a master are only bounded by what a Java array can hold. */
+    private static final int MAX_RDB_PAYLOAD = Integer.MAX_VALUE - 16;
+
+    private int maxArgs = MAX_ARGS;
+    private int maxBulk = DEFAULT_MAX_BULK;
+    private boolean unauthenticated;
 
     public RespReader(InputStream in) {
         this.in = in instanceof BufferedInputStream ? in : new BufferedInputStream(in);
@@ -31,6 +41,17 @@ public final class RespReader {
 
     public long consumed() {
         return consumed;
+    }
+
+    /**
+     * Limits for the next commands read. A server tightens these for clients
+     * that haven't authenticated yet, so an anonymous peer can't make it
+     * buffer large requests (the same rule Redis adopted for CVE-2021-32675).
+     */
+    public void setLimits(int maxArgs, int maxBulk, boolean unauthenticated) {
+        this.maxArgs = maxArgs;
+        this.maxBulk = maxBulk;
+        this.unauthenticated = unauthenticated;
     }
 
     /** True if the next read would not block. Used to decide when to flush pipelined replies. */
@@ -56,10 +77,10 @@ public final class RespReader {
         if (count <= 0) {
             return List.of();
         }
-        if (count > MAX_ARGS) {
-            throw new ProtocolException("invalid multibulk length");
+        if (count > maxArgs) {
+            throw new ProtocolException(unauthenticated ? "unauthenticated multibulk length" : "invalid multibulk length");
         }
-        List<byte[]> args = new ArrayList<>((int) count);
+        List<byte[]> args = new ArrayList<>((int) Math.min(count, INITIAL_CAPACITY_CAP));
         for (int i = 0; i < count; i++) {
             int type = readByte();
             if (type != '$') {
@@ -97,7 +118,7 @@ public final class RespReader {
             throw new ProtocolException("expected RDB payload, got '" + (char) type + "'");
         }
         long length = readLength();
-        if (length < 0 || length > MAX_BULK) {
+        if (length < 0 || length > MAX_RDB_PAYLOAD) {
             throw new ProtocolException("invalid RDB payload length " + length);
         }
         return readExactly((int) length);
@@ -109,6 +130,13 @@ public final class RespReader {
      * strings as byte[], arrays as List, and null bulk strings or arrays as null.
      */
     public Object readReply() throws IOException {
+        return readReply(0);
+    }
+
+    private Object readReply(int depth) throws IOException {
+        if (depth > MAX_REPLY_DEPTH) {
+            throw new ProtocolException("reply nested more than " + MAX_REPLY_DEPTH + " levels deep");
+        }
         int type = readByte();
         return switch (type) {
             case '+' -> readLine();
@@ -119,7 +147,7 @@ public final class RespReader {
                 if (length < 0) {
                     yield null;
                 }
-                if (length > MAX_BULK) {
+                if (length > maxBulk) {
                     throw new ProtocolException("invalid bulk length");
                 }
                 byte[] data = readExactly((int) length);
@@ -136,9 +164,9 @@ public final class RespReader {
                 if (count > MAX_ARGS) {
                     throw new ProtocolException("invalid array length");
                 }
-                List<Object> items = new ArrayList<>((int) count);
+                List<Object> items = new ArrayList<>((int) Math.min(count, INITIAL_CAPACITY_CAP));
                 for (int i = 0; i < count; i++) {
-                    items.add(readReply());
+                    items.add(readReply(depth + 1));
                 }
                 yield items;
             }
@@ -163,8 +191,8 @@ public final class RespReader {
 
     private byte[] readBulkBody() throws IOException {
         long length = readLength();
-        if (length < 0 || length > MAX_BULK) {
-            throw new ProtocolException("invalid bulk length");
+        if (length < 0 || length > maxBulk) {
+            throw new ProtocolException(unauthenticated && length >= 0 ? "unauthenticated bulk length" : "invalid bulk length");
         }
         byte[] data = readExactly((int) length);
         if (readByte() != '\r' || readByte() != '\n') {
