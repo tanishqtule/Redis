@@ -12,7 +12,9 @@ public final class Main {
             config = Config.fromArgs(args);
         } catch (IllegalArgumentException e) {
             System.err.println("error: " + e.getMessage());
-            System.err.println("usage: redis-java [--port N] [--replicaof \"host port\"] [--dir path] [--dbfilename name]");
+            System.err.println("usage: redis-java [config-file] [--directive value ...]");
+            System.err.println("  e.g. redis-java --port 6380 --requirepass-file /run/secrets/redis_password");
+            System.err.println("       redis-java /etc/redis-java.conf --replicaof \"10.0.0.5 6379\"");
             System.exit(1);
             return;
         }
