@@ -24,6 +24,7 @@ public final class Session {
     private volatile int listeningPort;
     private String name = "";
     private boolean linearizableReads;
+    private volatile Runnable closer = () -> { };
 
     public Session(String peer, OutputStream out, boolean fromMaster) {
         this.peer = peer;
@@ -37,6 +38,16 @@ public final class Session {
 
     public String peer() {
         return peer;
+    }
+
+    /** How to cut this connection off from another thread: closes the socket without flushing anything. */
+    public void setCloser(Runnable closer) {
+        this.closer = closer;
+    }
+
+    /** Disconnects the client immediately. Safe from any thread, and never blocks. */
+    public void kill() {
+        closer.run();
     }
 
     public String name() {

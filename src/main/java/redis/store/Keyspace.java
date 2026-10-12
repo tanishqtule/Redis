@@ -6,7 +6,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
-import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 import java.util.function.Predicate;
@@ -34,6 +33,27 @@ public final class Keyspace {
     }
 
     private record Deadline(long at, String key) {
+    }
+
+    /**
+     * A point-in-time copy of the live data, for writing snapshots without
+     * holding the command lock. Entries are immutable and values are never
+     * modified in place, so copying references is enough for a consistent copy.
+     */
+    public record Snapshot(List<String> keys, List<Entry> entries) {
+        public int size() {
+            return keys.size();
+        }
+
+        public int volatileKeys() {
+            int n = 0;
+            for (Entry entry : entries) {
+                if (entry.expireAt() != NO_EXPIRY) {
+                    n++;
+                }
+            }
+            return n;
+        }
     }
 
     private final Map<String, Entry> entries = new HashMap<>();
@@ -148,14 +168,18 @@ public final class Keyspace {
         return out;
     }
 
-    /** Visits every live entry. Used to write snapshots. */
-    public void forEachLive(BiConsumer<String, Entry> visitor) {
+    /** Copies the live entries. O(keys), and only references are copied. Caller holds the command lock. */
+    public Snapshot snapshot() {
         long now = now();
+        List<String> keys = new ArrayList<>(entries.size());
+        List<Entry> values = new ArrayList<>(entries.size());
         entries.forEach((key, entry) -> {
             if (!entry.expiredAt(now)) {
-                visitor.accept(key, entry);
+                keys.add(key);
+                values.add(entry);
             }
         });
+        return new Snapshot(keys, values);
     }
 
     /** Includes keys that have expired but haven't been collected yet, same as Redis' DBSIZE. */

@@ -14,10 +14,20 @@ import java.io.IOException;
  */
 final class Lzf {
 
+    /**
+     * The most one byte of input can expand to: a back-reference takes at
+     * least three bytes and copies at most 264. Anything claiming more is
+     * corrupt or hostile, and must not get to allocate the memory it asks for.
+     */
+    static final int MAX_EXPANSION = 88;
+
     private Lzf() {
     }
 
     static byte[] decompress(byte[] in, int expectedLength) throws IOException {
+        if (expectedLength < 0 || expectedLength > (long) in.length * MAX_EXPANSION) {
+            throw new IOException("LZF data of " + in.length + " bytes can't expand to " + expectedLength);
+        }
         byte[] out = new byte[expectedLength];
         int ip = 0;
         int op = 0;

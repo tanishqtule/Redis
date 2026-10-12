@@ -37,16 +37,25 @@ public final class Args {
         return new String(chars);
     }
 
+    /**
+     * Parses an integer the way Redis does: only the canonical form counts, so
+     * "+5", "007", "-0" and " 5" are all rejected (Long.parseLong accepts
+     * some of them).
+     */
     public static long parseLong(byte[] raw) {
         String s = str(raw);
-        // Long.parseLong would also accept "+5"; Redis doesn't.
-        if (s.isEmpty() || s.charAt(0) == '+' || s.length() > 20) {
+        if (s.isEmpty() || s.length() > 20) {
             throw CommandException.notInteger();
         }
+        long value;
         try {
-            return Long.parseLong(s);
+            value = Long.parseLong(s);
         } catch (NumberFormatException e) {
             throw CommandException.notInteger();
         }
+        if (!Long.toString(value).equals(s)) {
+            throw CommandException.notInteger();
+        }
+        return value;
     }
 }

@@ -21,6 +21,7 @@ import redis.command.CommandTable;
 import redis.command.KeyCommands;
 import redis.command.ServerCommands;
 import redis.persistence.Rdb;
+import redis.protocol.RespReader;
 import redis.replication.MasterLink;
 import redis.replication.ReplicationCommands;
 import redis.replication.ReplicationMaster;
@@ -47,6 +48,7 @@ public final class RedisServer implements AutoCloseable {
 
     private final Set<Socket> clients = ConcurrentHashMap.newKeySet();
     private ServerSocket listener;
+    private long lastAcceptWarning;
 
     public RedisServer(Config config) {
         this.config = config;
@@ -58,7 +60,8 @@ public final class RedisServer implements AutoCloseable {
             db.setOwnsExpiry(false);
             commands.setLinearizableReadBarrier(masterLink::awaitLinearizable);
         } else {
-            replication = new ReplicationMaster(lock, config.simulatedReplicationLagMs());
+            replication = new ReplicationMaster(lock, config.simulatedReplicationLagMs(),
+                    ReplicationMaster.DEFAULT_OUTPUT_LIMIT);
             if (config.simulatedReplicationLagMs() > 0) {
                 log.warning("simulating " + config.simulatedReplicationLagMs() + " ms of replication lag");
             }
@@ -70,7 +73,7 @@ public final class RedisServer implements AutoCloseable {
 
         new ServerCommands(config, db, replication != null ? replication::info : masterLink::info)
                 .registerAll(commands);
-        new KeyCommands(db).registerAll(commands);
+        new KeyCommands(db, RespReader.DEFAULT_MAX_BULK).registerAll(commands);
         new ReplicationCommands(replication, masterLink, db).registerAll(commands);
     }
 
@@ -129,9 +132,24 @@ public final class RedisServer implements AutoCloseable {
                         .start(new Connection(socket, commands, session -> onDisconnect(socket, session)));
             } catch (IOException e) {
                 if (!listener.isClosed()) {
-                    log.warning("accept failed: " + e.getMessage());
+                    // Typically out of file descriptors. Retrying at once would spin
+                    // a core and write hundreds of thousands of log lines a second.
+                    long now = System.currentTimeMillis();
+                    if (now - lastAcceptWarning > 1000) {
+                        lastAcceptWarning = now;
+                        log.warning("accept failed: " + e.getMessage());
+                    }
+                    pause(100);
                 }
             }
+        }
+    }
+
+    private static void pause(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 

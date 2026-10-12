@@ -37,6 +37,7 @@ final class Connection implements Runnable {
             RespReader reader = new RespReader(socket.getInputStream());
             OutputStream out = new BufferedOutputStream(socket.getOutputStream());
             session = new Session(socket.getRemoteSocketAddress().toString(), out, false);
+            session.setCloser(this::closeQuietly);
 
             while (!session.closeRequested()) {
                 List<byte[]> args;
@@ -75,6 +76,14 @@ final class Connection implements Runnable {
             if (session != null) {
                 onClose.accept(session);
             }
+        }
+    }
+
+    private void closeQuietly() {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // Already closed or broken; either way it's gone.
         }
     }
 }

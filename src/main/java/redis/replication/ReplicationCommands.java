@@ -2,15 +2,12 @@ package redis.replication;
 
 import static redis.command.Command.Flag.BLOCKING;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Set;
 
 import redis.command.Args;
 import redis.command.CommandException;
 import redis.command.CommandTable;
-import redis.persistence.Rdb;
 import redis.protocol.Resp;
 import redis.server.Session;
 import redis.store.Keyspace;
@@ -66,19 +63,16 @@ public final class ReplicationCommands {
         if (master == null) {
             throw new CommandException("ERR this replica can't serve other replicas (chained replication isn't supported)");
         }
-        if (session.inMulti()) {
-            throw new CommandException("ERR PSYNC inside MULTI is not allowed");
+        if (session.isReplica()) {
+            // A second writer on the same socket would interleave two streams.
+            throw new CommandException("ERR this connection is already a replica");
         }
         // Partial resync would need a backlog buffer; always doing a full one is correct, just slower.
-        byte[] snapshot = Rdb.write(db);
-        try {
-            // Anything already buffered for this client (REPLCONF replies) must go out first;
-            // after this the replica writer owns the stream.
-            session.out().flush();
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
-        master.startFullResync(session, snapshot);
+        // Nothing is flushed here: this runs under the command lock, and a peer
+        // that stopped reading would freeze the whole server. Replies still
+        // sitting in the output buffer go out first anyway, because the replica
+        // writer appends after them and is the only one writing from now on.
+        master.startFullResync(session, db.snapshot());
         return null;
     }
 

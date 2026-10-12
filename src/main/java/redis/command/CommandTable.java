@@ -210,13 +210,19 @@ public final class CommandTable {
         return Resp.array(replies);
     }
 
+    /**
+     * Same shape and limits as Redis: the name and the quoted arguments are cut
+     * at 128 characters, so an unknown command with a huge argument can't be
+     * used to make the server echo megabytes back.
+     */
     private static String unknownCommand(List<byte[]> args) {
-        StringBuilder sb = new StringBuilder("ERR unknown command '")
-                .append(Args.str(args, 0))
-                .append("', with args beginning with: ");
-        for (int i = 1; i < args.size(); i++) {
-            sb.append('\'').append(Args.str(args, i)).append("' ");
+        StringBuilder quoted = new StringBuilder();
+        for (int i = 1; i < args.size() && quoted.length() < 128; i++) {
+            String arg = Args.str(args, i);
+            quoted.append('\'').append(arg, 0, Math.min(arg.length(), 128 - quoted.length())).append("' ");
         }
-        return sb.toString();
+        String name = Args.str(args, 0);
+        return "ERR unknown command '" + name.substring(0, Math.min(name.length(), 128))
+                + "', with args beginning with: " + quoted;
     }
 }

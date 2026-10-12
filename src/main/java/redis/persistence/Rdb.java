@@ -45,7 +45,13 @@ public final class Rdb {
 
     // ---- writing ----
 
+    /** Serializes a live keyspace. Caller holds the command lock for the whole call. */
     public static byte[] write(Keyspace db) {
+        return write(db.snapshot());
+    }
+
+    /** Serializes a snapshot; safe to call without the command lock. */
+    public static byte[] write(Keyspace.Snapshot snapshot) {
         Out out = new Out();
         out.raw(("REDIS" + WRITE_VERSION).getBytes(StandardCharsets.US_ASCII));
         out.u8(OP_AUX);
@@ -55,18 +61,19 @@ public final class Rdb {
         out.u8(OP_SELECTDB);
         out.length(0);
         out.u8(OP_RESIZEDB);
-        out.length(db.size());
-        out.length(db.volatileKeys());
+        out.length(snapshot.size());
+        out.length(snapshot.volatileKeys());
 
-        db.forEachLive((key, entry) -> {
+        for (int i = 0; i < snapshot.size(); i++) {
+            Keyspace.Entry entry = snapshot.entries().get(i);
             if (entry.expireAt() != Keyspace.NO_EXPIRY) {
                 out.u8(OP_EXPIRETIME_MS);
                 out.int64LittleEndian(entry.expireAt());
             }
             out.u8(TYPE_STRING);
-            out.string(Args.raw(key));
+            out.string(Args.raw(snapshot.keys().get(i)));
             out.string(entry.value());
-        });
+        }
 
         out.u8(OP_EOF);
         byte[] body = out.toByteArray();
@@ -117,9 +124,17 @@ public final class Rdb {
 
     // ---- reading ----
 
-    /** Parses a whole RDB file. Only keys from database 0 are kept. */
+    /**
+     * Parses a whole RDB file. Only keys from database 0 are kept. Snapshots
+     * can come from a replication master, so malformed input of any kind
+     * surfaces as an IOException, never as some other exception.
+     */
     public static void read(byte[] data, Sink sink) throws IOException {
-        new In(data).readAll(sink);
+        try {
+            new In(data).readAll(sink);
+        } catch (RuntimeException e) {
+            throw new IOException("corrupt RDB data: " + e, e);
+        }
     }
 
     private static final class In {
@@ -247,7 +262,8 @@ public final class Rdb {
         }
 
         private byte[] bytes(int n) throws IOException {
-            if (n < 0 || pos + n > data.length) {
+            // Written as a subtraction: pos + n can overflow and pass the check.
+            if (n < 0 || n > data.length - pos) {
                 throw new IOException("RDB file truncated");
             }
             byte[] out = new byte[n];

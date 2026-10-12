@@ -11,6 +11,7 @@ import java.util.logging.Logger;
 import redis.command.Args;
 import redis.protocol.Resp;
 import redis.server.Session;
+import redis.store.Keyspace;
 
 /**
  * Master-side replication: the replication id and offset, the connected
@@ -27,15 +28,20 @@ public final class ReplicationMaster {
     private final String replId = randomReplId();
     private final List<ReplicaHandle> replicas = new CopyOnWriteArrayList<>();
     private final Object ackSignal = new Object();
+    /** Redis' default hard limit for replica output buffers. */
+    public static final long DEFAULT_OUTPUT_LIMIT = 256L * 1024 * 1024;
+
     private final ReentrantLock commandLock;
     private final long simulatedLagMillis;
+    private final long outputLimit;
 
     /** Guarded by the command lock for writes; volatile so INFO can read it without the lock. */
     private volatile long offset;
 
-    public ReplicationMaster(ReentrantLock commandLock, long simulatedLagMillis) {
+    public ReplicationMaster(ReentrantLock commandLock, long simulatedLagMillis, long outputLimit) {
         this.commandLock = commandLock;
         this.simulatedLagMillis = simulatedLagMillis;
+        this.outputLimit = outputLimit;
     }
 
     public String replId() {
@@ -58,13 +64,14 @@ public final class ReplicationMaster {
     /**
      * Turns a connection into a replica. Caller holds the command lock, which
      * is what makes this safe: the snapshot and the start offset describe the
-     * same moment, and no write can slip in between.
+     * same moment, and no write can slip in between. The snapshot is only
+     * copied here; serializing and sending it happen on the replica's own
+     * writer thread, so a big dataset doesn't stall everyone else.
      */
-    public void startFullResync(Session session, byte[] snapshot) {
-        ReplicaHandle replica = new ReplicaHandle(session, offset, simulatedLagMillis);
+    public void startFullResync(Session session, Keyspace.Snapshot snapshot) {
+        ReplicaHandle replica = new ReplicaHandle(session, offset, simulatedLagMillis, outputLimit);
         replica.send(Args.raw("+FULLRESYNC " + replId + " " + offset + "\r\n"));
-        replica.send(Args.raw("$" + snapshot.length + "\r\n"));
-        replica.send(snapshot);
+        replica.sendSnapshot(snapshot);
         session.markReplica();
         replicas.add(replica);
         replica.start();
@@ -116,7 +123,7 @@ public final class ReplicationMaster {
             commandLock.unlock();
         }
 
-        long deadline = timeoutMillis == 0 ? Long.MAX_VALUE : System.currentTimeMillis() + timeoutMillis;
+        long deadline = Timeouts.deadlineAfter(timeoutMillis);
         synchronized (ackSignal) {
             while (caughtUp(target) < needed) {
                 long remaining = deadline - System.currentTimeMillis();

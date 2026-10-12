@@ -19,6 +19,7 @@ import redis.command.CommandTable;
 import redis.persistence.Rdb;
 import redis.protocol.Resp;
 import redis.protocol.RespReader;
+import redis.server.Logs;
 import redis.server.Session;
 import redis.store.Keyspace;
 
@@ -84,9 +85,11 @@ public final class MasterLink implements Runnable {
         while (running) {
             try {
                 syncAndFollow();
-            } catch (IOException e) {
+            } catch (IOException | RuntimeException e) {
+                // Whatever the master sent, the link must come back: a replica
+                // that silently stops retrying is worse than one that keeps failing.
                 if (running) {
-                    log.warning("replication link to " + host + ":" + port + " failed: " + e.getMessage());
+                    log.warning("replication link to " + host + ":" + port + " failed: " + Logs.safe(e.toString()));
                 }
             } finally {
                 state = State.CONNECT;
@@ -128,7 +131,7 @@ public final class MasterLink implements Runnable {
         if (reached >= target) {
             return reached;
         }
-        long deadline = timeoutMillis == 0 ? Long.MAX_VALUE : System.currentTimeMillis() + timeoutMillis;
+        long deadline = Timeouts.deadlineAfter(timeoutMillis);
         synchronized (progress) {
             waiters++;
             try {

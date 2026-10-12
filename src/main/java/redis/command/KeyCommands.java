@@ -19,9 +19,12 @@ public final class KeyCommands {
     private static final Set<Command.Flag> R = Set.of(READ);
 
     private final Keyspace db;
+    private final int maxValueSize;
 
-    public KeyCommands(Keyspace db) {
+    /** @param maxValueSize the largest string APPEND may build (Redis' proto-max-bulk-len) */
+    public KeyCommands(Keyspace db, int maxValueSize) {
         this.db = db;
+        this.maxValueSize = maxValueSize;
     }
 
     public void registerAll(CommandTable table) {
@@ -129,6 +132,9 @@ public final class KeyCommands {
         if (current == null) {
             value = suffix;
         } else {
+            if ((long) current.value().length + suffix.length > maxValueSize) {
+                throw new CommandException("ERR string exceeds maximum allowed size (proto-max-bulk-len)");
+            }
             value = new byte[current.value().length + suffix.length];
             System.arraycopy(current.value(), 0, value, 0, current.value().length);
             System.arraycopy(suffix, 0, value, current.value().length, suffix.length);
@@ -192,7 +198,8 @@ public final class KeyCommands {
     }
 
     private byte[] flushAll(Session session, List<byte[]> args) {
-        if (args.size() > 2) {
+        // FLUSHALL [ASYNC | SYNC]; both mean the same thing here.
+        if (args.size() > 2 || args.size() == 2 && !Set.of("ASYNC", "SYNC").contains(Args.upper(args.get(1)))) {
             throw CommandException.syntax();
         }
         db.clear();
@@ -202,11 +209,13 @@ public final class KeyCommands {
     private byte[] expire(List<byte[]> args, long unitMs) {
         String key = Args.str(args, 1);
         long n = Args.parseLong(args.get(2));
-        String name = unitMs == 1000 ? "expire" : "pexpire";
-        if (Math.abs(n) > Long.MAX_VALUE / unitMs / 2) {
-            throw new CommandException("ERR invalid expire time in '" + name + "' command");
+        long at;
+        try {
+            at = Math.addExact(db.now(), Math.multiplyExact(n, unitMs));
+        } catch (ArithmeticException e) {
+            throw new CommandException("ERR invalid expire time in '" + (unitMs == 1000 ? "expire" : "pexpire") + "' command");
         }
-        return Resp.integer(db.setExpireAt(key, db.now() + n * unitMs) ? 1 : 0);
+        return Resp.integer(db.setExpireAt(key, at) ? 1 : 0);
     }
 
     private byte[] ttl(List<byte[]> args, long unitMs) {
