@@ -153,6 +153,76 @@ effect, so the change was reverted. The cause is still open. Next things to
 look at: the lock handoff between the link thread and client threads, and
 whether a read simply races the stream on a busy 4-core VM.
 
+## Third round: security, and running it for real
+
+The security review and its findings are in [SECURITY.md](SECURITY.md). The
+design decisions behind the fixes and the new features:
+
+**Closed by default, like Redis.** Protected mode, `requirepass`, and tight
+limits on what an unauthenticated connection may send are all Redis
+behaviour. Anything friendlier would have been a trap: a Redis-compatible
+server listening on every interface with no password is exactly how exposed
+Redis instances get taken over. The `-DENIED` message says how to fix it, so
+the safe default costs a minute, not an afternoon.
+
+**SCAN without Redis' cursor tricks.** Redis walks its hash table with a
+reverse-binary cursor so that a scan survives the table being resized, at the
+price of sometimes returning a key twice. Here every key gets a position, a
+SipHash of its name, and a sorted map indexes keys by position. The
+cursor is just "the next position to look at", so a key present for the whole
+scan comes back exactly once, however the keyspace changes in between. The
+hash is keyed with a secret chosen at startup, the same defence Redis uses
+for its own hash tables, so clients can't pick key names that pile up on one
+position. Keys that share a position share a bucket, and a bucket is scanned
+whole and searched one key at a time on removal.
+
+**Snapshots without fork().** Redis forks and lets the child write the
+snapshot from copy-on-write memory. The JVM can't fork, but stored values are
+immutable: every write replaces the entry object instead of changing it. So a
+snapshot copies only references while holding the command lock (about as fast
+as walking the map), and serializing and writing happen outside it.
+
+**The final save holds the lock until the end.** This one was learned the
+hard way. Releasing the lock after the snapshot is fine for `BGSAVE`, but at
+shutdown it let other clients keep writing until their connections closed,
+and those acknowledged writes went nowhere. A test that writes a counter
+during `SHUTDOWN SAVE` lost up to a thousand values per run before the fix.
+Redis never had this problem because a single thread can't serve anyone
+during its final save.
+
+**`maxmemory` is an estimate.** The JVM can't say how much heap one key uses,
+so each key is charged its bytes plus a fixed overhead (180 bytes, 90 more
+with a TTL), estimated from the objects a key needs: the key string and its
+array, the entry, the hash map node and the index node. That's consistent,
+which is what the eviction loop needs, but it isn't the real heap. Hence the startup
+warning when `maxmemory` is close to `-Xmx`, and the advice to run with
+`-XX:+ExitOnOutOfMemoryError`.
+
+**WATCH hooks into the keyspace, not the commands.** Every change to a key
+goes through three methods of `Keyspace` (put, remove, clear), so that's where
+watches get marked. Expiry, eviction, `FLUSHALL` and replicated writes are
+covered without each command having to remember. A command that doesn't
+change anything (`SETNX` on an existing key, an `INCR` that fails) never gets
+there, which is also how Redis decides.
+
+**Counters stay off the hot path.** The first version of `INFO` stats added a
+shared counter bumped under the command lock for every command, and pipelined
+GET dropped noticeably. With one lock, every core that runs a command pulls
+that counter's cache line over. Now the command count is a `LongAdder` bumped
+before taking the lock (it only spreads over cores when there's contention),
+hits and misses are counted per connection and summed on request, and the
+LRU clock of a key is only written when the millisecond has changed.
+
+**Signals instead of a shutdown hook.** A JVM shutdown hook looks like the
+natural place for "save on SIGTERM", and the first version used one. Testing
+the failure case showed two problems. The JVM exits after its hooks no matter
+what, so a failed save meant lost data. And `java.util.logging` closes its
+handlers in a hook of its own, so the shutdown's log lines, the error
+included, usually never appeared. Handling TERM and INT with
+`sun.misc.Signal` gives Redis' behaviour: exit 0 after a good save, keep
+running after a failed one. The JDK-internal API is the price; the shutdown
+hook stays as a fallback where the signals can't be taken (`-Xrs`).
+
 ## Verified against real Redis
 
 These were run by hand against redis-server 7.0.15, not in CI:
@@ -169,3 +239,15 @@ These were run by hand against redis-server 7.0.15, not in CI:
 - `ROLE` replies are byte-for-byte the same shape as Redis' on master and replica.
 - Linearizable reads from a redis-java replica of a real master: 0 stale out of 2,000 write-then-read
   pairs, where default reads were stale 79 times.
+- Passwords and TLS, both directions: `redis-cli -a` and `redis-cli --tls` against this server; a real
+  replica using `masterauth` (and TLS) syncing from it, and this server syncing from a real master the
+  same ways, linearizable reads included.
+- `redis-cli --scan` walks the keyspace with the new `SCAN`.
+- `WATCH`: 31 scenarios run against both servers over raw RESP gave identical replies, including the
+  corner cases (`INCRBY k 0` aborts, `SETNX` on an existing key doesn't, a key that expires after `WATCH`
+  aborts, one that had already expired doesn't).
+- redis-py 5.0.8: every call it makes for the supported commands works, including `transaction()`
+  under contention (6 threads, 1,800 increments, none lost).
+- Docker: the compose setup (password from a secret file, replica with `masterauth`, health checks,
+  non-root user) came up healthy, `docker stop` saved 501 keys and exited 0, and a restart loaded
+  them. A container without a password turned away clients coming through the published port.
