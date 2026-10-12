@@ -1,6 +1,7 @@
 package redis.command;
 
 import static redis.command.Command.Flag.BLOCKING;
+import static redis.command.Command.Flag.DENY_OOM;
 import static redis.command.Command.Flag.READ;
 import static redis.command.Command.Flag.TX_CONTROL;
 import static redis.command.Command.Flag.WRITE;
@@ -11,7 +12,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -40,6 +43,11 @@ public final class CommandTable {
     private final boolean readOnly;
 
     private boolean authRequired;
+    /** Commands accepted for execution. Striped, see dispatch(). */
+    private final LongAdder commandsProcessed = new LongAdder();
+    private Runnable onWrite = () -> { };
+    /** Run before commands that may add data; false means "over maxmemory and nothing could be evicted". */
+    private BooleanSupplier memoryGuard = () -> true;
     private Consumer<List<byte[]>> replicationSink = args -> { };
     /** Run before reads on connections that asked for linearizable reads. Only replicas set one. */
     private Runnable linearizableReadBarrier;
@@ -61,6 +69,20 @@ public final class CommandTable {
 
     public void register(String name, int arity, Command.Handler handler) {
         register(name, arity, Set.of(), handler);
+    }
+
+    public void setMemoryGuard(BooleanSupplier guard) {
+        this.memoryGuard = guard;
+    }
+
+    /** Called under the lock after every successful write, so persistence can count changes. */
+    public void setWriteListener(Runnable listener) {
+        this.onWrite = listener;
+    }
+
+    /** Commands executed (not counting ones refused before running). For INFO stats. */
+    public long commandsProcessed() {
+        return commandsProcessed.sum();
     }
 
     /** With a password set, everything but AUTH and QUIT needs an authenticated connection. */
@@ -114,6 +136,10 @@ public final class CommandTable {
             return Resp.QUEUED;
         }
 
+        // Counted here, before taking the lock: concurrent increments let the
+        // LongAdder spread over per-core cells, while increments under the lock
+        // never collide and so keep bouncing one shared counter between cores.
+        commandsProcessed.increment();
         if (needsReadBarrier(session, command)) {
             // Outside the lock: waiting for the replica to catch up must not stall everyone else.
             try {
@@ -154,9 +180,14 @@ public final class CommandTable {
     }
 
     private byte[] execute(Command command, Session session, List<byte[]> args) {
+        // A replica applies whatever its master sends; only the master decides what to evict.
+        if (command.has(DENY_OOM) && !session.isFromMaster() && !memoryGuard.getAsBoolean()) {
+            return Resp.error("OOM command not allowed when used memory > 'maxmemory'.");
+        }
         byte[] reply = invoke(command, session, args);
         if (command.has(WRITE) && !Resp.isError(reply)) {
             propagate(args);
+            onWrite.run();
         }
         return reply;
     }

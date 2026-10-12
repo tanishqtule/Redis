@@ -12,12 +12,15 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Logger;
 
@@ -25,6 +28,8 @@ import redis.command.Args;
 import redis.command.CommandTable;
 import redis.command.KeyCommands;
 import redis.command.ServerCommands;
+import redis.persistence.Persistence;
+import redis.persistence.PersistenceCommands;
 import redis.persistence.Rdb;
 import redis.protocol.Resp;
 import redis.replication.MasterLink;
@@ -58,7 +63,12 @@ public final class RedisServer implements AutoCloseable {
     private final MasterLink masterLink;
 
     private final Tls tls;
+    private final Persistence persistence;
+    private final AtomicBoolean closed = new AtomicBoolean();
     private final Set<Socket> clients = ConcurrentHashMap.newKeySet();
+    /** Hits and misses of connections that have already closed. */
+    private final LongAdder closedHits = new LongAdder();
+    private final LongAdder closedMisses = new LongAdder();
     private final Map<Long, Session> sessions = new ConcurrentHashMap<>();
     private final List<ServerSocket> listeners = new ArrayList<>();
     private final List<ServerSocket> tlsListeners = new ArrayList<>();
@@ -70,6 +80,13 @@ public final class RedisServer implements AutoCloseable {
         this.tls = Tls.fromConfig(config);
         this.commands = new CommandTable(lock, config.isReplica());
         commands.setAuthRequired(config.requirePass() != null);
+        this.persistence = new Persistence(config, lock, db);
+        commands.setWriteListener(() -> persistence.changed(1));
+        if (config.maxMemory() > 0 && !config.isReplica()) {
+            Random random = new Random();
+            commands.setMemoryGuard(() -> db.evictUntilUnder(config.maxMemory(), config.maxMemoryPolicy(),
+                    config.maxMemorySamples(), random, this::evicted));
+        }
 
         if (config.isReplica()) {
             replication = null;
@@ -84,13 +101,63 @@ public final class RedisServer implements AutoCloseable {
             masterLink = null;
             commands.setReplicationSink(replication::propagate);
             // Replicas never expire keys on their own, so tell them explicitly.
-            db.onExpire(key -> commands.propagate(List.of(Args.raw("DEL"), Args.raw(key))));
+            db.onExpire(key -> {
+                commands.propagate(List.of(Args.raw("DEL"), Args.raw(key)));
+                persistence.changed(1);
+                stats.expiredKeys.incrementAndGet();
+            });
         }
 
-        new ServerCommands(config, db, replication != null ? replication::info : masterLink::info)
-                .registerAll(commands);
+        new ServerCommands(config, db, new ServerCommands.ServerState() {
+            @Override
+            public List<String> replicationInfo() {
+                return replication != null ? replication.info() : masterLink.info();
+            }
+
+            @Override
+            public List<String> persistenceInfo() {
+                return persistence.info();
+            }
+
+            @Override
+            public Collection<Session> sessions() {
+                return sessions.values();
+            }
+
+            @Override
+            public Stats stats() {
+                return stats;
+            }
+
+            @Override
+            public long commandsProcessed() {
+                return commands.commandsProcessed();
+            }
+
+            @Override
+            public long[] keyspaceHitsAndMisses() {
+                long hits = closedHits.sum();
+                long misses = closedMisses.sum();
+                for (Session s : sessions.values()) {
+                    hits += s.keyspaceHits();
+                    misses += s.keyspaceMisses();
+                }
+                return new long[] {hits, misses};
+            }
+
+            @Override
+            public int port() {
+                return RedisServer.this.port();
+            }
+
+            @Override
+            public int tlsPort() {
+                return RedisServer.this.tlsPort();
+            }
+        }).registerAll(commands);
         new KeyCommands(db, config.protoMaxBulkLen()).registerAll(commands);
         new ReplicationCommands(replication, masterLink, db).registerAll(commands);
+        new PersistenceCommands(persistence, this::shutdown).registerAll(commands);
     }
 
     public void start() throws IOException {
@@ -122,6 +189,11 @@ public final class RedisServer implements AutoCloseable {
             throw e;
         }
         warnAboutExposure();
+        long heap = Runtime.getRuntime().maxMemory();
+        if (config.maxMemory() > heap * 0.7) {
+            log.warning("maxmemory (" + config.maxMemory() + " bytes) is close to or above the JVM heap ("
+                    + heap + " bytes). The estimate doesn't include everything the JVM needs; raise -Xmx or lower maxmemory.");
+        }
 
         for (ServerSocket listener : listeners) {
             Thread.ofPlatform().name("accept-" + listener.getLocalSocketAddress()).start(() -> acceptLoop(listener));
@@ -131,6 +203,42 @@ public final class RedisServer implements AutoCloseable {
         } else {
             housekeeping.scheduleWithFixedDelay(this::expireKeys, 100, 100, TimeUnit.MILLISECONDS);
         }
+        housekeeping.scheduleWithFixedDelay(persistence::checkSaveRules, 1, 1, TimeUnit.SECONDS);
+    }
+
+    /** An evicted key is gone for replicas too, and counts as a change for save rules. */
+    private void evicted(String key) {
+        commands.propagate(List.of(Args.raw("DEL"), Args.raw(key)));
+        persistence.changed(1);
+        stats.evictedKeys.incrementAndGet();
+    }
+
+    /**
+     * Stops the server, saving first when asked to ({@code save} true), or
+     * by default when save rules are configured ({@code save} null), as
+     * Redis does on SHUTDOWN and SIGTERM. Returns false, and keeps running,
+     * if the save fails; losing data silently would be worse.
+     */
+    public boolean shutdown(Boolean save) {
+        if (closed.get()) {
+            return true;
+        }
+        boolean wantSave = save != null ? save : !config.saveRules().isEmpty();
+        if (wantSave) {
+            try {
+                persistence.saveWhenIdle(60_000);
+            } catch (IOException e) {
+                log.severe("not shutting down: the final save failed: " + e.getMessage());
+                return false;
+            }
+        }
+        try {
+            close();
+        } catch (IOException e) {
+            log.warning("error while closing: " + e.getMessage());
+        }
+        log.info("redis-java is now ready to exit, bye bye...");
+        return true;
     }
 
     /** The bound port of the first listener, which differs from the configured one when that was 0. */
@@ -158,6 +266,9 @@ public final class RedisServer implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
         housekeeping.shutdownNow();
         if (masterLink != null) {
             masterLink.stop();
@@ -290,6 +401,8 @@ public final class RedisServer implements AutoCloseable {
     private void onDisconnect(Socket socket, Session session) {
         clients.remove(socket);
         sessions.remove(session.id());
+        closedHits.add(session.keyspaceHits());
+        closedMisses.add(session.keyspaceMisses());
         if (replication != null && session.isReplica()) {
             replication.remove(session);
         }

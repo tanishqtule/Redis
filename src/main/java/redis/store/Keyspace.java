@@ -1,11 +1,15 @@
 package redis.store;
 
+import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
+import java.util.Random;
+import java.util.TreeMap;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 import java.util.function.Predicate;
@@ -20,13 +24,50 @@ import java.util.function.Predicate;
  * 100 ms so keys nobody reads again don't sit in memory forever. Deadlines
  * live in a min-heap; entries are never removed from the heap when a key is
  * overwritten, they're just skipped when they come up and no longer match.
+ *
+ * Every key also has a position: a keyed hash (SipHash with a per-process
+ * secret). Keys are indexed by position, which gives SCAN a cursor that
+ * stays valid while keys come and go, and gives eviction cheap random
+ * samples.
  */
 public final class Keyspace {
 
     public static final long NO_EXPIRY = -1;
 
-    /** An immutable stored value. {@code expireAt} is unix time in ms, or NO_EXPIRY. */
-    public record Entry(byte[] value, long expireAt) {
+    /**
+     * Rough JVM cost of one key beyond its bytes: the String and its array
+     * header, the entry object, the hash map node and the position index
+     * node. An estimate, but a consistent one, which is what maxmemory needs.
+     */
+    static final int KEY_OVERHEAD = 180;
+    /** Extra for keys with a TTL: the deadline heap and the volatile index. */
+    static final int VOLATILE_OVERHEAD = 90;
+
+    /**
+     * A stored value. The value and deadline never change after creation,
+     * which is what lets snapshots copy references instead of data. Only the
+     * access time (for LRU eviction) is updated in place.
+     */
+    public static final class Entry {
+        private final byte[] value;
+        private final long expireAt;
+        private long lastAccess;
+
+        Entry(byte[] value, long expireAt, long now) {
+            this.value = value;
+            this.expireAt = expireAt;
+            this.lastAccess = now;
+        }
+
+        public byte[] value() {
+            return value;
+        }
+
+        /** Unix time in ms, or NO_EXPIRY. */
+        public long expireAt() {
+            return expireAt;
+        }
+
         boolean expiredAt(long now) {
             return expireAt != NO_EXPIRY && expireAt <= now;
         }
@@ -35,10 +76,14 @@ public final class Keyspace {
     private record Deadline(long at, String key) {
     }
 
+    /** A page of SCAN results. A next cursor of 0 means the scan is complete. */
+    public record ScanPage(long nextCursor, List<String> keys) {
+    }
+
     /**
      * A point-in-time copy of the live data, for writing snapshots without
-     * holding the command lock. Entries are immutable and values are never
-     * modified in place, so copying references is enough for a consistent copy.
+     * holding the command lock. Values and deadlines are immutable, so
+     * copying references is enough for a consistent copy.
      */
     public record Snapshot(List<String> keys, List<Entry> entries) {
         public int size() {
@@ -58,14 +103,22 @@ public final class Keyspace {
 
     private final Map<String, Entry> entries = new HashMap<>();
     private final PriorityQueue<Deadline> deadlines = new PriorityQueue<>(Comparator.comparingLong(Deadline::at));
+    /** Position -> key, or -> List of keys on the (astronomically rare) collision. */
+    private final TreeMap<Long, Object> positions = new TreeMap<>();
+    /** The same, for keys with a TTL only, so volatile-* eviction can sample them. */
+    private final TreeMap<Long, Object> volatilePositions = new TreeMap<>();
+    private final SipHash hasher;
     private final LongSupplier clock;
     private int volatileKeys;
+    private long usedMemory;
 
     private boolean ownsExpiry = true;
     private Consumer<String> onExpire = key -> { };
 
     public Keyspace(LongSupplier clock) {
         this.clock = clock;
+        SecureRandom random = new SecureRandom();
+        this.hasher = new SipHash(random.nextLong(), random.nextLong());
     }
 
     public Keyspace() {
@@ -91,7 +144,16 @@ public final class Keyspace {
 
     public Entry lookup(String key) {
         Entry entry = entries.get(key);
-        if (entry == null || !entry.expiredAt(now())) {
+        if (entry == null) {
+            return null;
+        }
+        long now = now();
+        if (!entry.expiredAt(now)) {
+            // Writing only when the millisecond changed keeps hot keys read-only
+            // in the common case, so their cache line isn't bounced between cores.
+            if (entry.lastAccess != now) {
+                entry.lastAccess = now;
+            }
             return entry;
         }
         if (ownsExpiry) {
@@ -106,12 +168,13 @@ public final class Keyspace {
         return entry == null ? null : entry.value();
     }
 
+
     public boolean exists(String key) {
         return lookup(key) != null;
     }
 
     public void set(String key, byte[] value, long expireAt) {
-        put(key, new Entry(value, expireAt));
+        put(key, new Entry(value, expireAt, now()));
     }
 
     /**
@@ -143,7 +206,7 @@ public final class Keyspace {
         if (at <= now()) {
             remove(key);
         } else {
-            put(key, new Entry(entry.value(), at));
+            put(key, new Entry(entry.value(), at, now()));
         }
         return true;
     }
@@ -153,7 +216,7 @@ public final class Keyspace {
         if (entry == null || entry.expireAt() == NO_EXPIRY) {
             return false;
         }
-        put(key, new Entry(entry.value(), NO_EXPIRY));
+        put(key, new Entry(entry.value(), NO_EXPIRY, now()));
         return true;
     }
 
@@ -168,7 +231,44 @@ public final class Keyspace {
         return out;
     }
 
-    /** Copies the live entries. O(keys), and only references are copied. Caller holds the command lock. */
+    /**
+     * One step of SCAN: looks at about {@code count} keys from position
+     * {@code cursor} on, in position order. A key that exists for the whole
+     * scan is returned exactly once, however many keys are added or removed
+     * meanwhile, which is the guarantee Redis gives (minus its duplicates).
+     */
+    public ScanPage scan(long cursor, int count, Predicate<String> filter) {
+        long now = now();
+        List<String> out = new ArrayList<>();
+        int examined = 0;
+        Long last = null;
+        for (Map.Entry<Long, Object> bucket : positions.tailMap(cursor, true).entrySet()) {
+            if (examined >= count) {
+                break;
+            }
+            // A whole bucket at a time, so the next cursor never splits one.
+            for (String key : keysAt(bucket.getValue())) {
+                examined++;
+                Entry entry = entries.get(key);
+                if (entry != null && !entry.expiredAt(now) && filter.test(key)) {
+                    out.add(key);
+                }
+            }
+            last = bucket.getKey();
+        }
+        if (last == null) {
+            return new ScanPage(0, out);
+        }
+        Long next = positions.higherKey(last);
+        return new ScanPage(next == null ? 0 : next, out);
+    }
+
+    /** A random key, or null if there are none. Close to uniform, since positions are hashes. */
+    public String randomKey(Random random) {
+        return randomFrom(positions, random);
+    }
+
+    /** Snapshot copy of the live entries; O(keys), and only references are copied. Caller holds the lock. */
     public Snapshot snapshot() {
         long now = now();
         List<String> keys = new ArrayList<>(entries.size());
@@ -191,10 +291,18 @@ public final class Keyspace {
         return volatileKeys;
     }
 
+    /** Estimated bytes used by keys and values, as maxmemory sees it. */
+    public long usedMemory() {
+        return usedMemory;
+    }
+
     public void clear() {
         entries.clear();
         deadlines.clear();
+        positions.clear();
+        volatilePositions.clear();
         volatileKeys = 0;
+        usedMemory = 0;
     }
 
     /**
@@ -220,13 +328,92 @@ public final class Keyspace {
         return removed;
     }
 
+    /**
+     * Evicts keys until the estimate is back under {@code maxMemory}. Returns
+     * false if that wasn't possible (noeviction, or no candidates left), in
+     * which case the caller should refuse the write.
+     */
+    public boolean evictUntilUnder(long maxMemory, Eviction.Policy policy, int samples, Random random,
+                                   Consumer<String> onEvict) {
+        while (usedMemory > maxMemory) {
+            if (policy == Eviction.Policy.NOEVICTION) {
+                return false;
+            }
+            String victim = pickVictim(policy, samples, random);
+            if (victim == null) {
+                return false;
+            }
+            remove(victim);
+            onEvict.accept(victim);
+        }
+        return true;
+    }
+
+    private String pickVictim(Eviction.Policy policy, int samples, Random random) {
+        TreeMap<Long, Object> pool = policy.volatileOnly() ? volatilePositions : positions;
+        if (pool.isEmpty()) {
+            return null;
+        }
+        if (policy == Eviction.Policy.ALLKEYS_RANDOM || policy == Eviction.Policy.VOLATILE_RANDOM) {
+            return randomFrom(pool, random);
+        }
+        // Approximated LRU/TTL, as in Redis: look at a few random keys and take the best of them.
+        long now = now();
+        String best = null;
+        long bestScore = Long.MAX_VALUE;
+        for (int i = 0; i < samples; i++) {
+            String key = randomFrom(pool, random);
+            Entry entry = entries.get(key);
+            if (entry == null) {
+                continue;
+            }
+            if (entry.expiredAt(now)) {
+                return key;
+            }
+            long score = policy == Eviction.Policy.VOLATILE_TTL ? entry.expireAt() : entry.lastAccess;
+            if (score < bestScore) {
+                bestScore = score;
+                best = key;
+            }
+        }
+        return best;
+    }
+
+    private static String randomFrom(TreeMap<Long, Object> index, Random random) {
+        if (index.isEmpty()) {
+            return null;
+        }
+        Map.Entry<Long, Object> bucket = index.ceilingEntry(random.nextLong() >>> 1);
+        if (bucket == null) {
+            bucket = index.firstEntry();
+        }
+        List<String> keys = keysAt(bucket.getValue());
+        return keys.get(random.nextInt(keys.size()));
+    }
+
     private void put(String key, Entry entry) {
         Entry old = entries.put(key, entry);
-        if (old != null && old.expireAt() != NO_EXPIRY) {
-            volatileKeys--;
+        boolean wasVolatile = old != null && old.expireAt() != NO_EXPIRY;
+        boolean isVolatile = entry.expireAt() != NO_EXPIRY;
+        // Hashing only when an index actually changes keeps the common
+        // overwrite (SET on an existing key without a TTL) as cheap as before.
+        long position = old == null || wasVolatile || isVolatile ? position(key) : 0;
+        if (old == null) {
+            index(positions, position, key);
+            usedMemory += KEY_OVERHEAD + key.length();
+        } else {
+            usedMemory -= old.value.length;
+            if (wasVolatile) {
+                volatileKeys--;
+                usedMemory -= VOLATILE_OVERHEAD;
+                unindex(volatilePositions, position, key);
+            }
         }
-        if (entry.expireAt() != NO_EXPIRY) {
+        usedMemory += entry.value.length;
+        if (isVolatile) {
             volatileKeys++;
+            usedMemory += VOLATILE_OVERHEAD;
+            index(volatilePositions, position, key);
             deadlines.add(new Deadline(entry.expireAt(), key));
             compactDeadlinesIfBloated();
         }
@@ -234,10 +421,56 @@ public final class Keyspace {
 
     private boolean remove(String key) {
         Entry old = entries.remove(key);
-        if (old != null && old.expireAt() != NO_EXPIRY) {
-            volatileKeys--;
+        if (old == null) {
+            return false;
         }
-        return old != null;
+        long position = position(key);
+        unindex(positions, position, key);
+        usedMemory -= KEY_OVERHEAD + key.length() + old.value.length;
+        if (old.expireAt() != NO_EXPIRY) {
+            volatileKeys--;
+            usedMemory -= VOLATILE_OVERHEAD;
+            unindex(volatilePositions, position, key);
+        }
+        return true;
+    }
+
+    private long position(String key) {
+        return hasher.hash(key.getBytes(StandardCharsets.ISO_8859_1)) >>> 1;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<String> keysAt(Object bucket) {
+        return bucket instanceof String key ? List.of(key) : (List<String>) bucket;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void index(TreeMap<Long, Object> index, long position, String key) {
+        Object current = index.get(position);
+        if (current == null) {
+            index.put(position, key);
+        } else if (current instanceof String other) {
+            List<String> both = new ArrayList<>(2);
+            both.add(other);
+            both.add(key);
+            index.put(position, both);
+        } else {
+            ((List<String>) current).add(key);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void unindex(TreeMap<Long, Object> index, long position, String key) {
+        Object current = index.get(position);
+        if (current instanceof String) {
+            index.remove(position);
+        } else if (current != null) {
+            List<String> keys = (List<String>) current;
+            keys.remove(key);
+            if (keys.size() == 1) {
+                index.put(position, keys.get(0));
+            }
+        }
     }
 
     // Refreshing the TTL of the same key over and over leaves dead heap

@@ -12,8 +12,12 @@ public final class Session {
 
     private final long id = ids.incrementAndGet();
     private final long createdAt = System.currentTimeMillis();
-    private volatile long lastActiveAt = createdAt;
-    private volatile String lastCommand = "NULL";
+    // Written by the connection's thread on every command and read only by
+    // CLIENT LIST from other threads. Not volatile on purpose: a slightly
+    // stale idle time is fine, a memory fence on every command isn't.
+    private long lastActiveAt = createdAt;
+    /** The raw name of the last command; only turned into text when someone runs CLIENT LIST. */
+    private byte[] lastCommand;
     private final String peer;
     private final OutputStream out;
     private final boolean fromMaster;
@@ -48,24 +52,52 @@ public final class Session {
         return lastActiveAt;
     }
 
-    public String lastCommand() {
-        return lastCommand;
-    }
-
     /**
-     * Bookkeeping for CLIENT LIST: when this client last did something, and
-     * what. The name is client-supplied, so it's cut short and stripped of
-     * anything that could break the line-per-client output.
+     * The last command's name, for CLIENT LIST. It's client-supplied, so it's
+     * cut short and stripped of anything that could break the line-per-client
+     * output.
      */
-    public void commandStarted(byte[] name) {
-        lastActiveAt = System.currentTimeMillis();
+    public String lastCommand() {
+        byte[] name = lastCommand;
+        if (name == null) {
+            return "NULL";
+        }
         int length = Math.min(name.length, 32);
         char[] chars = new char[length];
         for (int i = 0; i < length; i++) {
             int c = name[i] & 0xff;
             chars[i] = c > ' ' && c < 0x7f ? Character.toLowerCase((char) c) : '?';
         }
-        lastCommand = new String(chars);
+        return new String(chars);
+    }
+
+    // Keyspace hits and misses for INFO, counted per connection: a counter shared
+    // by all connections, bumped under the command lock, slowed hot GETs by a
+    // measurable amount. Totals are summed when someone asks.
+    private long keyspaceHits;
+    private long keyspaceMisses;
+
+    /** Counts a key lookup for INFO's keyspace_hits / keyspace_misses. */
+    public void countLookup(boolean hit) {
+        if (hit) {
+            keyspaceHits++;
+        } else {
+            keyspaceMisses++;
+        }
+    }
+
+    public long keyspaceHits() {
+        return keyspaceHits;
+    }
+
+    public long keyspaceMisses() {
+        return keyspaceMisses;
+    }
+
+    /** Bookkeeping for CLIENT LIST: when this client last did something, and what. */
+    public void commandStarted(byte[] name) {
+        lastActiveAt = System.currentTimeMillis();
+        lastCommand = name;
     }
 
     public String peer() {

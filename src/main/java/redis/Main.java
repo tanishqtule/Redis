@@ -20,6 +20,8 @@ public final class Main {
         }
         RedisServer server = new RedisServer(config);
         server.start();
+        // SIGTERM (docker stop, systemctl stop) saves first when save rules are set, like Redis.
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> server.shutdown(null), "shutdown"));
         server.awaitShutdown();
     }
 }

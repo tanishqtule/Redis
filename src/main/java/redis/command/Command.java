@@ -18,6 +18,8 @@ public record Command(String name, int arity, Set<Flag> flags, Handler handler) 
         WRITE,
         /** Reads the keyspace: a replica serving linearizable reads checks it's caught up first. */
         READ,
+        /** May add data, so it's refused (or causes eviction) when over maxmemory. */
+        DENY_OOM,
         /** Runs immediately even inside MULTI (MULTI, EXEC, DISCARD, ...). */
         TX_CONTROL,
         /** May block for a while, so it must not hold the global lock. */

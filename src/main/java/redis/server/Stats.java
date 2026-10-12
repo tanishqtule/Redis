@@ -7,9 +7,6 @@ public final class Stats {
 
     public final AtomicLong connectionsReceived = new AtomicLong();
     public final AtomicLong rejectedConnections = new AtomicLong();
-    public final AtomicLong commandsProcessed = new AtomicLong();
-    public final AtomicLong keyspaceHits = new AtomicLong();
-    public final AtomicLong keyspaceMisses = new AtomicLong();
     public final AtomicLong expiredKeys = new AtomicLong();
     public final AtomicLong evictedKeys = new AtomicLong();
 }
