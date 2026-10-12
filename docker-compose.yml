@@ -1,21 +1,46 @@
-# A master and one replica. Try:
-#   redis-cli -p 6379 set hello world
-#   redis-cli -p 6380 get hello
+# A password-protected master and replica, reachable from this machine only.
+#
+#   openssl rand -base64 32 > redis_password.txt
+#   chmod 644 redis_password.txt   # the container runs as an unprivileged user
+#   docker compose up -d
+#   redis-cli -p 6379 -a "$(cat redis_password.txt)" set hello world
+#   redis-cli -p 6380 -a "$(cat redis_password.txt)" get hello
+#
+# Without a password the server only accepts connections from inside its own
+# container (protected mode), so the password isn't optional here.
 services:
   master:
     build: .
+    command: ["--requirepass-file", "/run/secrets/redis_password"]
+    secrets: [redis_password]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379" # drop the 127.0.0.1 to expose it to the network
     volumes:
       - master-data:/data
+    # Time for the final save on docker stop before Docker kills the process.
+    stop_grace_period: 60s
 
   replica:
     build: .
-    command: ["--port", "6380", "--replicaof", "master 6379"]
+    command: ["--port", "6380", "--replicaof", "master 6379",
+              "--masterauth-file", "/run/secrets/redis_password",
+              "--requirepass-file", "/run/secrets/redis_password"]
+    secrets: [redis_password]
     ports:
-      - "6380:6380"
+      - "127.0.0.1:6380:6380"
+    volumes:
+      - replica-data:/data
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "/app/healthcheck.sh", "6380"]
     depends_on:
-      - master
+      master:
+        condition: service_healthy
+
+secrets:
+  redis_password:
+    file: ./redis_password.txt
 
 volumes:
   master-data:
+  replica-data:

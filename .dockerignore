@@ -1,0 +1,4 @@
+.git
+target
+*.rdb
+redis_password.txt
