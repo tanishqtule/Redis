@@ -159,11 +159,14 @@ public final class Config {
         return config;
     }
 
-    /** A copy with one more directive applied, e.g. {@code with("requirepass", "secret")}. */
+    /**
+     * A copy with one more directive applied, e.g. {@code with("requirepass", "secret")}.
+     * Settings that only make sense together (a TLS port and its certificate)
+     * are checked once the server is built, so the order of calls doesn't matter.
+     */
     public Config with(String directive, String... values) {
         Config c = copy();
         c.apply(directive, List.of(values));
-        c.validate();
         return c;
     }
 
@@ -298,12 +301,10 @@ public final class Config {
         }
     }
 
-    private void validate() {
+    /** Checks settings that depend on each other. Throws IllegalArgumentException. */
+    void validate() {
         if ((tlsCertFile == null) != (tlsKeyFile == null)) {
             throw new IllegalArgumentException("tls-cert-file and tls-key-file go together");
-        }
-        if ((tlsPort > 0 || tlsReplication) && tlsCertFile == null && tlsCaCertFile == null) {
-            throw new IllegalArgumentException("TLS needs tls-cert-file/tls-key-file (and tls-ca-cert-file to verify peers)");
         }
         if (tlsPort > 0 && tlsCertFile == null) {
             throw new IllegalArgumentException("tls-port needs tls-cert-file and tls-key-file");
@@ -317,6 +318,15 @@ public final class Config {
 
     public int port() {
         return port;
+    }
+
+    /**
+     * Whether to listen for plain-text clients. As in Redis, port 0 turns the
+     * plain port off when TLS is on; without TLS it means "any free port",
+     * which tests rely on.
+     */
+    public boolean plainTextEnabled() {
+        return port != 0 || tlsPort == 0;
     }
 
     /** Addresses to listen on; empty means all interfaces. */

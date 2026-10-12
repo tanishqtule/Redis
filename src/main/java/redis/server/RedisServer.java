@@ -57,19 +57,23 @@ public final class RedisServer implements AutoCloseable {
     private final ReplicationMaster replication;
     private final MasterLink masterLink;
 
+    private final Tls tls;
     private final Set<Socket> clients = ConcurrentHashMap.newKeySet();
     private final Map<Long, Session> sessions = new ConcurrentHashMap<>();
     private final List<ServerSocket> listeners = new ArrayList<>();
+    private final List<ServerSocket> tlsListeners = new ArrayList<>();
     private volatile long lastAcceptWarning;
 
-    public RedisServer(Config config) {
+    public RedisServer(Config config) throws IOException {
+        config.validate();
         this.config = config;
+        this.tls = Tls.fromConfig(config);
         this.commands = new CommandTable(lock, config.isReplica());
         commands.setAuthRequired(config.requirePass() != null);
 
         if (config.isReplica()) {
             replication = null;
-            masterLink = new MasterLink(config, this::port, lock, db, commands);
+            masterLink = new MasterLink(config, config.tlsReplication() ? tls : null, this::port, lock, db, commands);
             db.setOwnsExpiry(false);
             commands.setLinearizableReadBarrier(masterLink::awaitLinearizable);
         } else {
@@ -94,13 +98,23 @@ public final class RedisServer implements AutoCloseable {
             loadSnapshot();
         }
         try {
+            List<InetAddress> addresses = new ArrayList<>();
             if (config.bind().isEmpty()) {
-                listeners.add(listen(null, config.port()));
+                addresses.add(null);
             } else {
                 for (String address : config.bind()) {
-                    listeners.add(listen(address.equals("*") ? null : InetAddress.getByName(address), config.port()));
+                    addresses.add(address.equals("*") ? null : InetAddress.getByName(address));
                 }
             }
+            for (InetAddress address : addresses) {
+                if (config.plainTextEnabled()) {
+                    listeners.add(listen(new ServerSocket(), address, config.port()));
+                }
+                if (config.tlsPort() > 0) {
+                    tlsListeners.add(listen(tls.serverSocket(), address, config.tlsPort()));
+                }
+            }
+            listeners.addAll(tlsListeners);
         } catch (IOException e) {
             for (ServerSocket listener : listeners) {
                 listener.close();
@@ -122,6 +136,11 @@ public final class RedisServer implements AutoCloseable {
     /** The bound port of the first listener, which differs from the configured one when that was 0. */
     public int port() {
         return listeners.get(0).getLocalPort();
+    }
+
+    /** The bound TLS port, or 0 without TLS. */
+    public int tlsPort() {
+        return tlsListeners.isEmpty() ? 0 : tlsListeners.get(0).getLocalPort();
     }
 
     public Stats stats() {
@@ -152,8 +171,7 @@ public final class RedisServer implements AutoCloseable {
         stopped.countDown();
     }
 
-    private ServerSocket listen(InetAddress address, int port) throws IOException {
-        ServerSocket listener = new ServerSocket();
+    private ServerSocket listen(ServerSocket listener, InetAddress address, int port) throws IOException {
         listener.setReuseAddress(true);
         try {
             listener.bind(new InetSocketAddress(address, port));
@@ -162,7 +180,7 @@ public final class RedisServer implements AutoCloseable {
             throw new IOException("can't listen on " + (address == null ? "*" : address.getHostAddress()) + ":" + port
                     + ": " + e.getMessage(), e);
         }
-        log.info("listening on " + listener.getLocalSocketAddress());
+        log.info("listening on " + listener.getLocalSocketAddress() + (listener instanceof javax.net.ssl.SSLServerSocket ? " (TLS)" : ""));
         return listener;
     }
 

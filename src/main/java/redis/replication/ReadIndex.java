@@ -1,6 +1,7 @@
 package redis.replication;
 
 import java.io.IOException;
+import java.net.Socket;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -8,6 +9,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 
 import redis.protocol.RespClient;
+import redis.server.Tls;
 
 /**
  * Asks the master for its current replication position, the "read index" a
@@ -35,6 +37,7 @@ final class ReadIndex implements AutoCloseable {
     private final int port;
     private final int timeoutMillis;
     private final String password;
+    private final Tls tls;
 
     private final Object lock = new Object();
     /** Callers waiting for a request that hasn't been sent yet. Guarded by lock. */
@@ -45,11 +48,13 @@ final class ReadIndex implements AutoCloseable {
     private volatile RespClient master;
     private final AtomicLong roundTrips = new AtomicLong();
 
-    ReadIndex(String host, int port, int timeoutMillis, String password) {
+    /** @param tls when non-null, talk to the master over TLS */
+    ReadIndex(String host, int port, int timeoutMillis, String password, Tls tls) {
         this.host = host;
         this.port = port;
         this.timeoutMillis = timeoutMillis;
         this.password = password;
+        this.tls = tls;
     }
 
     /** Returns a position the master had reached at some point after this call began. */
@@ -106,7 +111,8 @@ final class ReadIndex implements AutoCloseable {
         try {
             RespClient client = master;
             if (client == null) {
-                client = RespClient.connect(host, port, timeoutMillis, password);
+                Socket socket = tls != null ? tls.clientSocket() : new Socket();
+                client = RespClient.connect(socket, host, port, timeoutMillis, password);
                 master = client;
             }
             Object reply = client.call("INFO", "replication");

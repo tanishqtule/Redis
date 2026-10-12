@@ -28,7 +28,12 @@ public final class RespClient implements AutoCloseable {
     }
 
     public RespClient(String host, int port, int timeoutMillis) throws IOException {
-        socket = new Socket();
+        this(new Socket(), host, port, timeoutMillis);
+    }
+
+    /** Connects an unconnected socket, which may be a TLS one. */
+    public RespClient(Socket unconnected, String host, int port, int timeoutMillis) throws IOException {
+        socket = unconnected;
         try {
             socket.connect(new InetSocketAddress(host, port), timeoutMillis);
             socket.setSoTimeout(timeoutMillis);
@@ -43,7 +48,12 @@ public final class RespClient implements AutoCloseable {
 
     /** Connects and, when {@code password} isn't null, authenticates. A refused password is an IOException. */
     public static RespClient connect(String host, int port, int timeoutMillis, String password) throws IOException {
-        RespClient client = new RespClient(host, port, timeoutMillis);
+        return connect(new Socket(), host, port, timeoutMillis, password);
+    }
+
+    public static RespClient connect(Socket unconnected, String host, int port, int timeoutMillis, String password)
+            throws IOException {
+        RespClient client = new RespClient(unconnected, host, port, timeoutMillis);
         if (password != null) {
             Object reply = client.call("AUTH", password);
             if (!"OK".equals(reply)) {

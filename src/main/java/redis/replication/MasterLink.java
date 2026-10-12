@@ -22,6 +22,7 @@ import redis.protocol.RespReader;
 import redis.server.Config;
 import redis.server.Logs;
 import redis.server.Session;
+import redis.server.Tls;
 import redis.store.Keyspace;
 
 /**
@@ -39,6 +40,7 @@ public final class MasterLink implements Runnable {
     private final String host;
     private final int port;
     private final String masterAuth;
+    private final Tls tls;
     private final IntSupplier listeningPort;
     private final ReentrantLock commandLock;
     private final Keyspace db;
@@ -71,16 +73,18 @@ public final class MasterLink implements Runnable {
     private final Object progress = new Object();
     private volatile int waiters;
 
-    public MasterLink(Config config, IntSupplier listeningPort,
+    /** @param tls non-null when the replica talks to its master over TLS (tls-replication yes) */
+    public MasterLink(Config config, Tls tls, IntSupplier listeningPort,
                       ReentrantLock commandLock, Keyspace db, CommandTable commands) {
         this.host = config.masterHost();
         this.port = config.masterPort();
         this.masterAuth = config.masterAuth();
+        this.tls = tls;
         this.listeningPort = listeningPort;
         this.commandLock = commandLock;
         this.db = db;
         this.commands = commands;
-        this.readIndex = new ReadIndex(host, port, LINEARIZABLE_READ_TIMEOUT_MS, masterAuth);
+        this.readIndex = new ReadIndex(host, port, LINEARIZABLE_READ_TIMEOUT_MS, masterAuth, tls);
     }
 
     @Override
@@ -226,7 +230,7 @@ public final class MasterLink implements Runnable {
     }
 
     private void syncAndFollow() throws IOException {
-        try (Socket s = new Socket()) {
+        try (Socket s = tls != null ? tls.clientSocket() : new Socket()) {
             socket = s;
             state = State.CONNECTING;
             s.connect(new InetSocketAddress(host, port), 5000);
